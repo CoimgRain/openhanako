@@ -111,7 +111,7 @@ export function ChannelMessages() {
     const onScroll = () => { checkNearBottom(); };
     el.addEventListener('scroll', onScroll, { passive: true });
     return () => el.removeEventListener('scroll', onScroll);
-  }, [checkNearBottom, getScrollContainer, messages.length]);
+  }, [checkNearBottom, getScrollContainer, messages]);
 
   useEffect(() => {
     const el = getScrollContainer();
