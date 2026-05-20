@@ -288,6 +288,21 @@
     pointer-events: none;
 }
 
+.sessionAgentPairBadge {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    flex-shrink: 0;
+    pointer-events: none;
+}
+
+.sessionAgentPairArrow {
+    color: var(--text-muted);
+    font-size: 0.58rem;
+    line-height: 1;
+    opacity: 0.78;
+}
+
 .sessionAgentBadgeText {
     width: 16px;
     height: 16px;
@@ -416,4 +431,50 @@
     padding: var(--space-lg) var(--space-sm);
     color: var(--text-muted);
     font-size: 0.78rem;
+}
+
+.sessionCountdown {
+    position: absolute;
+    top: 5px;
+    right: 6px;
+    width: 16px;
+    height: 16px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    pointer-events: none;
+}
+
+.sessionCountdown svg {
+    display: block;
+    transform: rotate(-90deg);
+}
+
+.sessionCountdownTrack,
+.sessionCountdownValue {
+    fill: none;
+    stroke-width: 2;
+}
+
+.sessionCountdownTrack {
+    stroke: rgba(var(--accent-rgb), 0.12);
+}
+
+.sessionCountdownValue {
+    stroke: currentColor;
+    stroke-linecap: round;
+    transition: stroke-dashoffset 1s linear, color var(--duration-fast);
+}
+
+.sessionCountdownSafe {
+    color: var(--accent);
+}
+
+.sessionCountdownWarn {
+    color: #d6a21f;
+}
+
+.sessionCountdownDanger {
+    color: var(--danger);
 }

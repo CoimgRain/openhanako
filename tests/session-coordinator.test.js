@@ -2170,6 +2170,121 @@ describe("SessionCoordinator", () => {
     expect(result.sessionFiles).toEqual([producedFile]);
   });
 
+  it("lists subagent sessions as read-only collaboration projections", async () => {
+    const agentsDir = path.join(tempDir, "agents");
+    const agentDir = path.join(agentsDir, "hanako");
+    const subagentDir = path.join(agentDir, "subagent-sessions");
+    fs.mkdirSync(subagentDir, { recursive: true });
+    const childPath = path.join(subagentDir, "child.jsonl");
+    const nowIso = new Date().toISOString();
+    fs.writeFileSync(childPath, [
+      JSON.stringify({ type: "session", id: "child", timestamp: nowIso, cwd: "/tmp/work" }),
+      JSON.stringify({
+        type: "message",
+        id: "u1",
+        timestamp: nowIso,
+        message: { role: "user", content: "执行阶段一" },
+      }),
+      JSON.stringify({
+        type: "message",
+        id: "a1",
+        timestamp: nowIso,
+        message: { role: "assistant", content: "收到" },
+      }),
+      "",
+    ].join("\n"));
+    fs.writeFileSync(path.join(subagentDir, "session-meta.json"), JSON.stringify({
+      "child.jsonl": {
+        requesterAgentId: "hanako",
+        requesterAgentNameSnapshot: "小颜",
+        executorAgentId: "agent-b",
+        executorAgentNameSnapshot: "小库",
+        taskId: "subagent-1",
+        taskTitle: "执行阶段一",
+        parentSessionPath: path.join(agentDir, "sessions", "parent.jsonl"),
+      },
+    }, null, 2));
+
+    const coordinator = new SessionCoordinator({
+      agentsDir,
+      getAgent: () => ({ agentName: "小颜", sessionDir: path.join(agentDir, "sessions") }),
+      getActiveAgentId: () => "hanako",
+      getModels: () => ({ authStorage: {}, modelRegistry: {}, resolveThinkingLevel: () => "medium" }),
+      getResourceLoader: () => ({ getSystemPrompt: () => "BASE" }),
+      getSkills: () => null,
+      buildTools: () => ({ tools: [], customTools: [] }),
+      emitEvent: () => {},
+      getHomeCwd: () => tempDir,
+      agentIdFromSessionPath: () => "hanako",
+      switchAgentOnly: async () => {},
+      getConfig: () => ({}),
+      getPrefs: () => ({ getThinkingLevel: () => "medium" }),
+      getAgents: () => new Map(),
+      getActivityStore: () => null,
+      getAgentById: (id) => ({ agentName: id === "agent-b" ? "小库" : "小颜" }),
+      listAgents: () => [{ id: "hanako", name: "小颜" }, { id: "agent-b", name: "小库" }],
+    });
+
+    const sessions = await coordinator.listSessions();
+    const child = sessions.find((item) => item.path === childPath);
+    expect(child).toMatchObject({
+      kind: "subagent",
+      collaborationKind: "subagent",
+      readOnly: true,
+      requesterAgentId: "hanako",
+      requesterAgentName: "小颜",
+      executorAgentId: "agent-b",
+      executorAgentName: "小库",
+      taskId: "subagent-1",
+      taskTitle: "执行阶段一",
+    });
+    expect(child.title).toContain("小颜 ↔ 小库");
+  });
+
+  it("auto-deletes idle completed subagent projections after ten minutes", async () => {
+    const agentsDir = path.join(tempDir, "agents");
+    const agentDir = path.join(agentsDir, "hanako");
+    const subagentDir = path.join(agentDir, "subagent-sessions");
+    fs.mkdirSync(subagentDir, { recursive: true });
+    const childPath = path.join(subagentDir, "old-child.jsonl");
+    const oldIso = new Date(Date.now() - 11 * 60 * 1000).toISOString();
+    fs.writeFileSync(childPath, [
+      JSON.stringify({ type: "session", id: "old-child", timestamp: oldIso, cwd: "/tmp/work" }),
+      JSON.stringify({ type: "message", id: "u1", timestamp: oldIso, message: { role: "user", content: "旧任务" } }),
+      JSON.stringify({ type: "message", id: "a1", timestamp: oldIso, message: { role: "assistant", content: "完成" } }),
+      "",
+    ].join("\n"));
+    fs.writeFileSync(path.join(subagentDir, "session-meta.json"), JSON.stringify({
+      "old-child.jsonl": { executorAgentId: "agent-b", executorAgentNameSnapshot: "小库" },
+    }, null, 2));
+
+    const coordinator = new SessionCoordinator({
+      agentsDir,
+      getAgent: () => ({ agentName: "小颜", sessionDir: path.join(agentDir, "sessions") }),
+      getActiveAgentId: () => "hanako",
+      getModels: () => ({ authStorage: {}, modelRegistry: {}, resolveThinkingLevel: () => "medium" }),
+      getResourceLoader: () => ({ getSystemPrompt: () => "BASE" }),
+      getSkills: () => null,
+      buildTools: () => ({ tools: [], customTools: [] }),
+      emitEvent: () => {},
+      getHomeCwd: () => tempDir,
+      agentIdFromSessionPath: () => "hanako",
+      switchAgentOnly: async () => {},
+      getConfig: () => ({}),
+      getPrefs: () => ({ getThinkingLevel: () => "medium" }),
+      getAgents: () => new Map(),
+      getActivityStore: () => null,
+      getAgentById: () => null,
+      listAgents: () => [{ id: "hanako", name: "小颜" }, { id: "agent-b", name: "小库" }],
+    });
+
+    const sessions = await coordinator.listSessions();
+    expect(sessions.find((item) => item.path === childPath)).toBeUndefined();
+    expect(fs.existsSync(childPath)).toBe(false);
+    const meta = JSON.parse(fs.readFileSync(path.join(subagentDir, "session-meta.json"), "utf-8"));
+    expect(meta["old-child.jsonl"]).toBeUndefined();
+  });
+
   it("switchSession 拒绝 subagent-sessions/activity/.ephemeral 等旁路路径", async () => {
     const coordinator = new SessionCoordinator({
       agentsDir: "/tmp/agents",

@@ -182,6 +182,7 @@ function InputAreaInner({ surface }: Required<InputAreaProps>) {
   const pendingNewSession = useStore(s => s.pendingNewSession);
   const pendingSessionSwitchPath = useStore(s => s.pendingSessionSwitchPath);
   const currentSessionPath = useStore(s => s.currentSessionPath);
+  const currentSessionReadOnly = useStore(s => !!(s.currentSessionPath && s.sessions.find(session => session.path === s.currentSessionPath)?.readOnly));
   const compacting = useStore(s => currentSessionPath ? s.compactingSessions.includes(currentSessionPath) : false);
   const screenshotBusy = useStore(s => s.screenshotTaskCount > 0);
   const screenshotProgress = useStore(s => s.screenshotProgress);
@@ -697,7 +698,7 @@ function InputAreaInner({ surface }: Required<InputAreaProps>) {
   const hasContent = inputText.trim().length > 0 || attachedFiles.length > 0 || docContextAttached || !!quotedSelection
     || editorHasInlineNode(editor, 'skillBadge')
     || editorHasInlineNode(editor, 'fileBadge');
-  const canSend = hasContent && connected && !isStreaming && !modelSwitching && !pendingSessionSwitchPath;
+  const canSend = hasContent && connected && !isStreaming && !modelSwitching && !pendingSessionSwitchPath && !currentSessionReadOnly;
 
   const loadVisionAuxiliaryConfig = useCallback(async () => {
     const res = await hanaFetch('/api/preferences/models');
@@ -826,6 +827,7 @@ function InputAreaInner({ surface }: Required<InputAreaProps>) {
 
   // ── Send message ──
   const handleSend = useCallback(async () => {
+    if (currentSessionReadOnly) return;
     if (!editor) return;
     const editorJson = editor.getJSON();
     const { text: rawText, skills, fileRefs } = serializeEditor(editorJson);
@@ -1005,7 +1007,7 @@ function InputAreaInner({ surface }: Required<InputAreaProps>) {
     } finally {
       setSending(false);
     }
-  }, [editor, attachedFiles, docContextAttached, connected, isStreaming, sending, pendingNewSession, currentDoc, clearAttachedFiles, clearDraft, currentSessionPath, setDocContextAttached, slashCommands, slashSelected, handleSlashSelect, supportsVision, currentModelInfo, loadVisionAuxiliaryConfig, modelSwitching, t]);
+  }, [editor, currentSessionReadOnly, attachedFiles, docContextAttached, connected, isStreaming, sending, pendingNewSession, currentDoc, clearAttachedFiles, clearDraft, currentSessionPath, setDocContextAttached, slashCommands, slashSelected, handleSlashSelect, supportsVision, currentModelInfo, loadVisionAuxiliaryConfig, modelSwitching, t]);
 
   // ── Steer ──
   const handleSteer = useCallback(async () => {
@@ -1135,29 +1137,47 @@ function InputAreaInner({ surface }: Required<InputAreaProps>) {
     }
   }, [addToast, completingTodos, currentSessionPath, sessionTodos.length]);
 
+  const statusBars = (
+    <InputStatusBars
+      slashBusy={slashBusy}
+      slashBusyLabel={slashCommands.find(c => c.name === slashBusy)?.busyLabel || t('common.executing')}
+      compacting={compacting}
+      compactingLabel={t('chat.compacting')}
+      screenshotBusy={screenshotBusy}
+      screenshotLabel={t('common.screenshotInProgress')}
+      screenshotPageLabel={screenshotProgress && screenshotProgress.totalPages > 0
+        ? t('common.screenshotProgressPage', {
+          current: screenshotProgress.currentPage,
+          total: screenshotProgress.totalPages,
+        })
+        : null}
+      screenshotProgress={screenshotProgress}
+      inlineError={inlineError}
+      slashResult={slashResult}
+      onResultClick={slashResult?.deskDir ? handleSlashResultClick : undefined}
+    />
+  );
+
+  if (currentSessionReadOnly) {
+    return (
+      <div
+        className={`${styles['input-surface']}${surface === 'mobile' ? ` ${styles['input-surface-mobile']}` : ''}`}
+        ref={inputSurfaceRef}
+      >
+        {statusBars}
+        <div className={styles['read-only-session-notice']}>
+          内部 Agent 对话，只读查看。阶段二会支持你加入群聊。
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div
       className={`${styles['input-surface']}${surface === 'mobile' ? ` ${styles['input-surface-mobile']}` : ''}`}
       ref={inputSurfaceRef}
     >
-      <InputStatusBars
-        slashBusy={slashBusy}
-        slashBusyLabel={slashCommands.find(c => c.name === slashBusy)?.busyLabel || t('common.executing')}
-        compacting={compacting}
-        compactingLabel={t('chat.compacting')}
-        screenshotBusy={screenshotBusy}
-        screenshotLabel={t('common.screenshotInProgress')}
-        screenshotPageLabel={screenshotProgress && screenshotProgress.totalPages > 0
-          ? t('common.screenshotProgressPage', {
-            current: screenshotProgress.currentPage,
-            total: screenshotProgress.totalPages,
-          })
-          : null}
-        screenshotProgress={screenshotProgress}
-        inlineError={inlineError}
-        slashResult={slashResult}
-        onResultClick={slashResult?.deskDir ? handleSlashResultClick : undefined}
-      />
+      {statusBars}
       <InputContextRow
         attachedFiles={attachedFiles}
         removeAttachedFile={removeAttachedFile}

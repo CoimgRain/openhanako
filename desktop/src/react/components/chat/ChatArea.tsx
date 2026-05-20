@@ -8,6 +8,7 @@
 import { memo, useRef, useEffect, useState, useCallback, useMemo } from 'react';
 import { useStore } from '../../stores';
 import { loadMoreMessages } from '../../stores/session-actions';
+import { hanaUrl } from '../../hooks/use-hana-fetch';
 import { useContinuousBottomScroll } from '../../hooks/use-continuous-bottom-scroll';
 
 const EMPTY_ITEMS: ChatListItem[] = [];
@@ -76,7 +77,20 @@ const Panel = memo(function Panel({ path, active }: { path: string; active: bool
   const hasMore = useStore(s => s.chatSessions[path]?.hasMore ?? false);
   const loadingMore = useStore(s => s.chatSessions[path]?.loadingMore ?? false);
   const isSessionStreaming = useStore(s => s.streamingSessions.includes(path));
-  const sessionAgentId = useStore(s => s.sessions.find(se => se.path === path)?.agentId ?? null);
+  const sessionInfo = useStore(s => s.sessions.find(se => se.path === path) ?? null);
+  const sessionAgentId = sessionInfo?.executorAgentId || sessionInfo?.agentId || null;
+  const readOnly = sessionInfo?.readOnly === true;
+  const userIdentity = useMemo(() => {
+    if (!readOnly) return undefined;
+    const requesterAgentId = sessionInfo?.requesterAgentId || null;
+    const requesterAgent = requesterAgentId
+      ? useStore.getState().agents.find(agent => agent.id === requesterAgentId)
+      : null;
+    return {
+      name: sessionInfo?.requesterAgentName || requesterAgent?.name || requesterAgentId || 'Agent',
+      avatarUrl: requesterAgent?.hasAvatar ? hanaUrl(`/api/agents/${requesterAgent.id}/avatar?t=${Date.now()}`) : null,
+    };
+  }, [readOnly, sessionInfo?.requesterAgentId, sessionInfo?.requesterAgentName]);
   const ref = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
   const messageElementsRef = useRef(new Map<string, HTMLDivElement>());
@@ -201,6 +215,8 @@ const Panel = memo(function Panel({ path, active }: { path: string; active: bool
             items={items}
             sessionPath={path}
             agentId={sessionAgentId}
+            readOnly={readOnly}
+            userIdentity={userIdentity}
             registerMessageElement={registerMessageElement}
           />
           {isSessionStreaming && (

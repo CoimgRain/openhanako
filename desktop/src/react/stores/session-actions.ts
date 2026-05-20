@@ -225,14 +225,34 @@ export async function loadSessions(): Promise<void> {
   try {
     const res = await hanaFetch('/api/sessions');
     const data = await res.json();
-    const sessions = data || [];
+    const incomingSessions = data || [];
 
     const s = useStore.getState();
+    const incomingPaths = new Set(incomingSessions.map((session: any) => session.path));
+    const incomingSubagentTaskIds = new Set(
+      incomingSessions
+        .filter((session: any) => session?.kind === 'subagent' || session?.collaborationKind === 'subagent')
+        .map((session: any) => session.taskId)
+        .filter(Boolean),
+    );
+    const subagentTtlMs = 10 * 60 * 1000;
+    const now = Date.now();
+    const preservedOptimisticSubagents = (s.sessions || []).filter((session: any) => {
+      const isSubagent = session?.kind === 'subagent' || session?.collaborationKind === 'subagent';
+      if (!isSubagent || !session?._optimistic) return false;
+      if (incomingPaths.has(session.path)) return false;
+      if (session.taskId && incomingSubagentTaskIds.has(session.taskId)) return false;
+      const modifiedMs = Date.parse(session.modified || '');
+      if (Number.isFinite(modifiedMs) && now - modifiedMs >= subagentTtlMs) return false;
+      return true;
+    });
+    const sessions = [...preservedOptimisticSubagents, ...incomingSessions];
     useStore.setState({ sessions });
 
     if (sessions.length > 0 && !s.currentSessionPath && !s.pendingNewSession && !s.pendingSessionSwitchPath) {
-      // 首次加载：走完整的 switchSession 确保后端同步 + 消息加载
-      await switchSession(sessions[0].path);
+      // 首次加载优先进入普通对话；subagent 协作会话是只读投影，不抢主焦点。
+      const firstSession = sessions.find((session: any) => !session.readOnly) || sessions[0];
+      await switchSession(firstSession.path);
     }
   } catch { /* ignore */ }
 }
@@ -258,6 +278,58 @@ export async function switchSession(path: string): Promise<void> {
   const activePanel = useStore.getState().activePanel;
   if (activePanel === 'activity' || activePanel === 'automation') {
     useStore.getState().setActivePanel(null);
+  }
+
+  const targetSession = s.sessions.find((session: any) => session.path === path);
+  if (targetSession?.readOnly) {
+    let touchedModified: string | null = null;
+    try {
+      const touchRes = await hanaFetch('/api/sessions/subagent/touch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path }),
+      });
+      const touchData = await touchRes.json();
+      touchedModified = typeof touchData?.modified === 'string' ? touchData.modified : null;
+    } catch (err) {
+      console.warn('[session] touch subagent failed:', err);
+    }
+
+    const state = useStore.getState();
+    const currentPath = s.currentSessionPath;
+    if (currentPath) {
+      useStore.setState(prev => ({
+        attachedFilesBySession: { ...prev.attachedFilesBySession, [currentPath]: [...state.attachedFiles] },
+      }));
+    }
+
+    useStore.setState(prev => ({
+      sessions: touchedModified
+        ? prev.sessions.map((session: any) => session.path === path ? { ...session, modified: touchedModified } : session)
+        : prev.sessions,
+      currentSessionPath: path,
+      pendingSessionSwitchPath: null,
+      pendingNewSession: false,
+      selectedFolder: null,
+      workspaceFolders: [],
+      selectedAgentId: null,
+      welcomeVisible: false,
+      memoryEnabled: false,
+      attachedFiles: state.attachedFilesBySession[path] || [],
+      deskContextAttached: false,
+      docContextAttached: false,
+    }));
+
+    window.dispatchEvent(new CustomEvent('hana-plan-mode', {
+      detail: { enabled: true, mode: 'read_only' },
+    }));
+
+    if (!useStore.getState().chatSessions?.[path]) {
+      await loadMessages(path);
+      if (myVersion !== _switchVersion) return;
+    }
+    useStore.setState({ contextTokens: null, contextWindow: null, contextPercent: null });
+    return;
   }
 
   const abortController = new AbortController();
@@ -601,6 +673,47 @@ export async function archiveSession(path: string): Promise<void> {
   } catch (err) {
     console.error('[session] archive failed:', err);
     showSidebarToast(window.t('session.archiveFailed'));
+  }
+}
+
+export async function deleteSubagentSession(path: string): Promise<void> {
+  try {
+    const res = await hanaFetch('/api/sessions/subagent/delete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path }),
+    });
+    const data = await res.json();
+    if (data.error) {
+      console.error('[session] delete subagent failed:', data.error);
+      showSidebarToast(data.error === 'session_busy' ? '内部对话仍在运行，暂不能删除' : '删除失败');
+      return;
+    }
+
+    const state = useStore.getState();
+    const isCurrent = path === state.currentSessionPath;
+    clearSessionRuntimeCaches(path);
+    useStore.setState((prev: Record<string, any>) => {
+      const chatSessions: Record<string, any> = { ...(prev.chatSessions || {}) };
+      delete chatSessions[path];
+      return {
+        sessions: (prev.sessions || []).filter((session: any) => session.path !== path),
+        chatSessions,
+        ...(isCurrent ? { currentSessionPath: null, welcomeVisible: true } : {}),
+      };
+    });
+    if (isCurrent) clearChatAction();
+
+    await loadSessions();
+    const updated = useStore.getState();
+    if (isCurrent && !updated.currentSessionPath) {
+      const next = updated.sessions.find((session: any) => !session.readOnly) || updated.sessions[0];
+      if (next) await switchSession(next.path);
+      else await createNewSession();
+    }
+  } catch (err) {
+    console.error('[session] delete subagent failed:', err);
+    showSidebarToast('删除失败');
   }
 }
 

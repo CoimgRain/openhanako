@@ -241,3 +241,10 @@ export function isActiveSessionPath(sessionPath, agentsDir) {
   if (parts.length === 4 && parts[2] === "archived") return true;
   return false;
 }
+
+export function isSubagentSessionPath(sessionPath, agentsDir) {
+  const rel = relativePathInsideBase(sessionPath, agentsDir);
+  if (rel === null) return false;
+  const parts = rel.split(path.sep);
+  return parts.length === 3 && parts[1] === "subagent-sessions" && parts[2].endsWith(".jsonl");
+}

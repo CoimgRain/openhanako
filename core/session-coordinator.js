@@ -30,7 +30,7 @@ import {
   getStableFeatureDisabledToolNames,
   toolNamesFromObjects,
 } from "./tool-availability.js";
-import { isActiveSessionPath } from "./message-utils.js";
+import { isActiveSessionPath, isSubagentSessionPath } from "./message-utils.js";
 import { formatWorkspaceScopePrompt, normalizeWorkspaceScope } from "../shared/workspace-scope.js";
 import { getProviderPromptPatches } from "./provider-prompt-patches.js";
 import { prepareVisionInputForTextOnlyModel } from "./vision-prepare.js";
@@ -47,8 +47,13 @@ import {
   snapshotSkillsForSession,
 } from "../lib/skills/session-skill-snapshot.js";
 import { SessionListProjectionCache } from "./session-list-projection-cache.js";
+import { deleteSubagentSessionMeta } from "../lib/subagent-executor-metadata.js";
+import { deleteSessionFileSidecarSync } from "../lib/session-files/session-file-registry.js";
+import { deleteSessionSkillSnapshotSync } from "../lib/skills/session-skill-snapshot.js";
 
 const log = createModuleLogger("session");
+const SUBAGENT_IDLE_DELETE_MS = 10 * 60 * 1000;
+
 
 /** 巡检/定时任务默认工具白名单（"*" = 与 chat 一致，全部放行） */
 export const PATROL_TOOLS_DEFAULT = "*";
@@ -1938,12 +1943,20 @@ export class SessionCoordinator {
 
   async listSessions() {
     const agents = this._d.listAgents();
+    const agentById = new Map(agents.map((a) => [a.id, a]));
+    const agentNameFor = (agentId, snapshot = null) => {
+      const live = agentId ? agentById.get(agentId) : null;
+      return snapshot || live?.name || live?.agentName || agentId || null;
+    };
 
     // 并行处理每个 agent，避免串行同步 I/O 阻塞事件循环
     const perAgent = await Promise.all(agents.map(async (agent) => {
       const sessionDir = path.join(this._d.agentsDir, agent.id, "sessions");
-      try { await fsp.access(sessionDir); } catch { return []; }
+      const subagentDir = path.join(this._d.agentsDir, agent.id, "subagent-sessions");
+      const visibleSessions = [];
+
       try {
+        await fsp.access(sessionDir);
         const [sessions, titles, meta] = await Promise.all([
           this._sessionListProjectionCache.list(sessionDir),
           this._loadSessionTitlesFor(sessionDir),
@@ -1965,13 +1978,64 @@ export class SessionCoordinator {
             s.modelId = metaEntry?.modelId || null;
             s.modelProvider = null;
           }
+          visibleSessions.push(s);
         }
-        return sessions;
       } catch (err) {
-        // 显式日志：之前静默吞错会让用户看到「对话框列表为空」却没有任何线索 (#414)
-        log.warn(`listSessions: agent="${agent.id}" sessionDir="${sessionDir}" failed: ${err?.message || err}`);
-        return [];
+        if (err?.code !== "ENOENT") {
+          // 显式日志：之前静默吞错会让用户看到「对话框列表为空」却没有任何线索 (#414)
+          log.warn(`listSessions: agent="${agent.id}" sessionDir="${sessionDir}" failed: ${err?.message || err}`);
+        }
       }
+
+      try {
+        await fsp.access(subagentDir);
+        const [subagentSessions, subagentMeta] = await Promise.all([
+          this._sessionListProjectionCache.list(subagentDir),
+          this._readMetaCached(path.join(subagentDir, "session-meta.json")),
+        ]);
+        for (const s of subagentSessions) {
+          if (await this._shouldAutoDeleteSubagentSession(s)) {
+            await this.deleteSubagentSession(s.path, { skipStreamingCheck: true });
+            continue;
+          }
+          const meta = subagentMeta[path.basename(s.path)] || {};
+          const requesterAgentId = meta.requesterAgentId || meta.parentAgentId || agent.id;
+          const requesterAgentName = agentNameFor(
+            requesterAgentId,
+            meta.requesterAgentNameSnapshot || meta.parentAgentNameSnapshot || agent.name,
+          );
+          const executorAgentId = meta.executorAgentId || meta.agentId || agent.id;
+          const executorAgentName = agentNameFor(
+            executorAgentId,
+            meta.executorAgentNameSnapshot || meta.agentName,
+          );
+          const taskTitle = meta.taskTitle || meta.taskSummary || s.firstMessage || "";
+          s.kind = "subagent";
+          s.collaborationKind = "subagent";
+          s.readOnly = true;
+          s.title = `${requesterAgentName || "Agent"} ↔ ${executorAgentName || "Agent"}${taskTitle ? `: ${taskTitle}` : ""}`;
+          s.firstMessage = taskTitle || s.firstMessage || "Agent collaboration";
+          s.agentId = executorAgentId;
+          s.agentName = executorAgentName;
+          s.executorAgentId = executorAgentId;
+          s.executorAgentName = executorAgentName;
+          s.requesterAgentId = requesterAgentId;
+          s.requesterAgentName = requesterAgentName;
+          s.requestedAgentId = meta.requestedAgentId || null;
+          s.requestedAgentName = meta.requestedAgentNameSnapshot || null;
+          s.parentSessionPath = meta.parentSessionPath || s.parentSessionPath || null;
+          s.taskId = meta.taskId || null;
+          s.taskTitle = taskTitle || null;
+          s.pinnedAt = null;
+          visibleSessions.push(s);
+        }
+      } catch (err) {
+        if (err?.code !== "ENOENT") {
+          log.warn(`listSessions: agent="${agent.id}" subagentDir="${subagentDir}" failed: ${err?.message || err}`);
+        }
+      }
+
+      return visibleSessions;
     }));
     const allSessions = perAgent.flat();
 
@@ -2006,6 +2070,56 @@ export class SessionCoordinator {
 
     allSessions.sort((a, b) => b.modified - a.modified);
     return allSessions;
+  }
+
+  async _shouldAutoDeleteSubagentSession(sessionProjection) {
+    const sessionPath = sessionProjection?.path;
+    if (!sessionPath || sessionPath === this.currentSessionPath) return false;
+    if (!isSubagentSessionPath(sessionPath, this._d.agentsDir)) return false;
+    if (this.isSessionStreaming(sessionPath)) return false;
+    const modified = sessionProjection.modified instanceof Date
+      ? sessionProjection.modified.getTime()
+      : new Date(sessionProjection.modified || 0).getTime();
+    return Number.isFinite(modified) && Date.now() - modified >= SUBAGENT_IDLE_DELETE_MS;
+  }
+
+  async touchSubagentSession(sessionPath) {
+    if (!isSubagentSessionPath(sessionPath, this._d.agentsDir)) {
+      throw new Error(`touchSubagentSession: path must be in agents/{id}/subagent-sessions/ — got ${sessionPath}`);
+    }
+    const now = new Date();
+    await fsp.utimes(sessionPath, now, now);
+    const entry = this._sessions.get(sessionPath);
+    if (entry) entry.lastTouchedAt = now.getTime();
+    this._sessionListProjectionCache.invalidate(path.dirname(sessionPath));
+    return now;
+  }
+
+  async deleteSubagentSession(sessionPath, { skipStreamingCheck = false } = {}) {
+    if (!isSubagentSessionPath(sessionPath, this._d.agentsDir)) {
+      throw new Error(`deleteSubagentSession: path must be in agents/{id}/subagent-sessions/ — got ${sessionPath}`);
+    }
+    if (!skipStreamingCheck && this.isSessionStreaming(sessionPath)) {
+      throw new Error("session_busy");
+    }
+
+    try { await this.closeSession(sessionPath); } catch {}
+    try { await fsp.unlink(sessionPath); } catch (err) { if (err?.code !== "ENOENT") throw err; }
+    try { deleteSessionFileSidecarSync(sessionPath); } catch {}
+    try { deleteSessionSkillSnapshotSync(sessionPath); } catch {}
+    await deleteSubagentSessionMeta(sessionPath);
+
+    this._sessionListProjectionCache.invalidate(path.dirname(sessionPath));
+    this._metaCache.delete(path.join(path.dirname(sessionPath), "session-meta.json"));
+    this._sessions.delete(sessionPath);
+    this._hibernatedSessionMeta.delete(sessionPath);
+    this._clearRuntimePressureTimer(sessionPath);
+
+    if (this._currentSessionPath === sessionPath) {
+      this._currentSessionPath = null;
+      this._session = null;
+      this._sessionStarted = false;
+    }
   }
 
   async saveSessionTitle(sessionPath, title) {

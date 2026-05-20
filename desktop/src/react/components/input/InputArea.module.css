@@ -1386,3 +1386,14 @@
 .input-box p {
     margin: 0;
 }
+
+.read-only-session-notice {
+    margin: var(--space-sm) 0 var(--space-xs);
+    padding: 10px 12px;
+    border: 1px solid rgba(var(--accent-rgb), 0.18);
+    border-radius: var(--radius-md);
+    background: rgba(var(--accent-rgb), 0.08);
+    color: var(--text-muted);
+    font-size: 0.78rem;
+    text-align: center;
+}

@@ -36,6 +36,19 @@ export interface Session {
   cwd: string | null;
   pinnedAt?: string | null;
   hasSummary?: boolean;
+  kind?: string | null;
+  collaborationKind?: 'subagent' | string | null;
+  readOnly?: boolean;
+  pendingSubagent?: boolean;
+  requesterAgentId?: string | null;
+  requesterAgentName?: string | null;
+  executorAgentId?: string | null;
+  executorAgentName?: string | null;
+  requestedAgentId?: string | null;
+  requestedAgentName?: string | null;
+  parentSessionPath?: string | null;
+  taskId?: string | null;
+  taskTitle?: string | null;
   rcAttachment?: {
     sessionKey: string;
     platform: string;

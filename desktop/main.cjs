@@ -1186,6 +1186,17 @@ function createMainWindow() {
 
   loadWindowURL(mainWindow, "index");
 
+  if (process.argv.includes("--dev")) {
+    mainWindow.webContents.on("console-message", (_event, level, message, line, sourceId) => {
+      console.log(`[renderer:${level}] ${redactMainLogText(sourceId || "unknown")}:${line} ${redactMainLogText(message)}`);
+    });
+    mainWindow.webContents.on("did-fail-load", (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {
+      console.error(
+        `[desktop] mainWindow did-fail-load mainFrame=${Boolean(isMainFrame)} code=${errorCode} url=${redactMainLogText(validatedURL)} error=${redactMainLogText(errorDescription)}`
+      );
+    });
+  }
+
   // 前端初始化超时保护：30 秒内没收到 app-ready 就强制显示（防止用户卡在空白）
   const initTimeout = setTimeout(() => {
     if (_startHiddenAtLogin) return;

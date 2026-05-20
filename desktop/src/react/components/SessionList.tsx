@@ -11,7 +11,7 @@ import { useStore } from '../stores';
 import { hanaFetch } from '../hooks/use-hana-fetch';
 import { useI18n } from '../hooks/use-i18n';
 import { formatSessionDate } from '../utils/format';
-import { switchSession, archiveSession, renameSession, pinSession } from '../stores/session-actions';
+import { switchSession, archiveSession, renameSession, pinSession, deleteSubagentSession, loadSessions } from '../stores/session-actions';
 import { updateKeyed } from '../stores/create-keyed-slice';
 import type { Session, Agent } from '../types';
 import { AgentAvatar, resolveAgentDisplayInfo } from '../utils/agent-display';
@@ -19,6 +19,9 @@ import { buildSessionSections } from './session-sections';
 import { ContextMenu, type ContextMenuItem } from '../ui/ContextMenu';
 import { renderMarkdown } from '../utils/markdown';
 import styles from './SessionList.module.css';
+
+
+const SUBAGENT_SESSION_TTL_MS = 10 * 60 * 1000;
 
 interface BrowserSessionState {
   url: string | null;
@@ -72,6 +75,7 @@ function SessionListInner() {
   const browserBySession = useStore(s => s.browserBySession);
 
   const [browserSessions, setBrowserSessions] = useState<Record<string, BrowserSessionState>>({});
+  const [countdownNow, setCountdownNow] = useState(() => Date.now());
   const closingBrowserSessionsRef = useRef(new Set<string>());
 
   const setVisibleBrowserSessions = useCallback((data: unknown) => {
@@ -81,6 +85,24 @@ function SessionListInner() {
     }
     setBrowserSessions(states);
   }, []);
+
+  const hasSubagentCountdown = sessions.some(s => (s.collaborationKind === 'subagent' || s.kind === 'subagent') && s.readOnly);
+  useEffect(() => {
+    if (!hasSubagentCountdown) return;
+    const timer = window.setInterval(() => setCountdownNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [hasSubagentCountdown]);
+
+  useEffect(() => {
+    const hasExpiredSubagent = sessions.some(s => {
+      const isSubagent = (s.collaborationKind === 'subagent' || s.kind === 'subagent') && s.readOnly;
+      if (!isSubagent || streamingSessions.includes(s.path)) return false;
+      const modifiedMs = Date.parse(s.modified || '');
+      return Number.isFinite(modifiedMs) && countdownNow - modifiedMs >= SUBAGENT_SESSION_TTL_MS;
+    });
+    if (!hasExpiredSubagent) return;
+    void loadSessions();
+  }, [countdownNow, sessions, streamingSessions]);
 
   // Fetch browser sessions (re-fetch when browser state changes)
   useEffect(() => {
@@ -140,10 +162,11 @@ function SessionListInner() {
             key={s.path}
             session={s}
             isActive={!pendingNewSession && s.path === activeSessionPath}
-            isStreaming={streamingSessions.includes(s.path)}
+            isStreaming={streamingSessions.includes(s.path) || !!s.pendingSubagent}
             isPinned={!!s.pinnedAt}
             agents={agents}
             browserState={browserSessions[s.path] || null}
+            countdownNow={countdownNow}
             onCloseBrowser={handleCloseBrowserSession}
           />
         ));
@@ -178,13 +201,14 @@ function SessionListInner() {
 
 // ── Session Item ──
 
-const SessionItem = memo(function SessionItem({ session: s, isActive, isStreaming, isPinned, agents, browserState, onCloseBrowser }: {
+const SessionItem = memo(function SessionItem({ session: s, isActive, isStreaming, isPinned, agents, browserState, countdownNow, onCloseBrowser }: {
   session: Session;
   isActive: boolean;
   isStreaming: boolean;
   isPinned: boolean;
   agents: Agent[];
   browserState: BrowserSessionState | null;
+  countdownNow: number;
   onCloseBrowser: (sessionPath: string) => void;
 }) {
   const { t } = useI18n();
@@ -195,13 +219,18 @@ const SessionItem = memo(function SessionItem({ session: s, isActive, isStreamin
   const inputRef = useRef<HTMLInputElement>(null);
 
   const handleClick = useCallback(() => {
-    if (editing) return;
+    if (editing || s.pendingSubagent) return;
     switchSession(s.path);
-  }, [s.path, editing]);
+  }, [s.path, s.pendingSubagent, editing]);
 
   const handleArchive = useCallback((e: React.MouseEvent) => {
     e.stopPropagation();
     archiveSession(s.path);
+  }, [s.path]);
+
+  const handleDeleteSubagent = useCallback((e: React.MouseEvent) => {
+    e.stopPropagation();
+    deleteSubagentSession(s.path);
   }, [s.path]);
 
   const handlePin = useCallback((e: React.MouseEvent) => {
@@ -240,9 +269,10 @@ const SessionItem = memo(function SessionItem({ session: s, isActive, isStreamin
   const handleContextMenu = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
     e.stopPropagation();
+    if (s.readOnly) return;
     setSummaryPreviewPosition(null);
     setMenuPosition({ x: e.clientX, y: e.clientY });
-  }, []);
+  }, [s.readOnly]);
 
   // Auto-focus input when editing starts
   useEffect(() => {
@@ -252,9 +282,13 @@ const SessionItem = memo(function SessionItem({ session: s, isActive, isStreamin
     }
   }, [editing]);
 
+  const isCollaboration = s.collaborationKind === 'subagent' || s.kind === 'subagent';
+
   // Meta line
   const parts: string[] = [];
-  if (s.agentName || s.agentId) parts.push(s.agentName || s.agentId!);
+  if (isCollaboration) {
+    parts.push(s.pendingSubagent ? 'Agent 对话 · 建立中' : 'Agent 对话 · 只读');
+  } else if (s.agentName || s.agentId) parts.push(s.agentName || s.agentId!);
   if (s.cwd) {
     const dirName = s.cwd.split(/[/\\]/).filter(Boolean).pop();
     if (dirName) parts.push(dirName);
@@ -288,10 +322,21 @@ const SessionItem = memo(function SessionItem({ session: s, isActive, isStreamin
         onContextMenu={handleContextMenu}
       >
         <div className={styles.sessionItemHeader}>
-          {s.agentId && (
+          {isCollaboration ? (
+            <AgentPairBadge
+              requesterAgentId={s.requesterAgentId || null}
+              requesterAgentName={s.requesterAgentName || null}
+              executorAgentId={s.executorAgentId || s.agentId || null}
+              executorAgentName={s.executorAgentName || s.agentName || null}
+              agents={agents}
+            />
+          ) : s.agentId ? (
             <AgentBadge agentId={s.agentId} agentName={s.agentName} agents={agents} />
-          )}
+          ) : null}
           {isStreaming && <span className={styles.sessionStreamingDot} />}
+          {isCollaboration && !isStreaming && !s.pendingSubagent && (
+            <SubagentCountdown modified={s.modified} now={countdownNow} />
+          )}
           {editing ? (
             <input
               ref={inputRef}
@@ -309,7 +354,7 @@ const SessionItem = memo(function SessionItem({ session: s, isActive, isStreamin
           )}
         </div>
 
-        {!editing && (
+        {!editing && !s.readOnly && (
           <div className={styles.sessionPinBtn} title={t(isPinned ? 'session.unpin' : 'session.pin')} onClick={handlePin}>
             <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
               <path d="M12 17v5" />
@@ -320,7 +365,7 @@ const SessionItem = memo(function SessionItem({ session: s, isActive, isStreamin
           </div>
         )}
 
-        {!editing && (
+        {!editing && !s.readOnly && (
           <div className={styles.sessionRenameBtn} title={t('session.rename')} onClick={startRename}>
             <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
               <path d="M17 3a2.83 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z" />
@@ -328,13 +373,25 @@ const SessionItem = memo(function SessionItem({ session: s, isActive, isStreamin
           </div>
         )}
 
-        <div className={styles.sessionArchiveBtn} title={t('session.archive')} onClick={handleArchive}>
-          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <polyline points="21 8 21 21 3 21 3 8" />
-            <rect x="1" y="3" width="22" height="5" />
-            <line x1="10" y1="12" x2="14" y2="12" />
-          </svg>
-        </div>
+        {s.readOnly && isCollaboration && !s.pendingSubagent ? (
+          <div className={styles.sessionArchiveBtn} title="删除内部对话" onClick={handleDeleteSubagent}>
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <polyline points="3 6 5 6 21 6" />
+              <path d="M19 6l-1 14H6L5 6" />
+              <path d="M10 11v6" />
+              <path d="M14 11v6" />
+              <path d="M9 6V4h6v2" />
+            </svg>
+          </div>
+        ) : !s.readOnly && (
+          <div className={styles.sessionArchiveBtn} title={t('session.archive')} onClick={handleArchive}>
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <polyline points="21 8 21 21 3 21 3 8" />
+              <rect x="1" y="3" width="22" height="5" />
+              <line x1="10" y1="12" x2="14" y2="12" />
+            </svg>
+          </div>
+        )}
 
         <div className={styles.sessionItemMeta}>
           {parts.join(' · ')}
@@ -568,6 +625,63 @@ function formatRcPlatform(platform: string) {
 }
 
 // ── Agent Avatar Badge ──
+
+
+const SubagentCountdown = memo(function SubagentCountdown({ modified, now }: {
+  modified: string | null;
+  now: number;
+}) {
+  const modifiedMs = Date.parse(modified || '');
+  const remaining = Number.isFinite(modifiedMs)
+    ? Math.max(0, SUBAGENT_SESSION_TTL_MS - (now - modifiedMs))
+    : SUBAGENT_SESSION_TTL_MS;
+  const ratio = Math.max(0, Math.min(1, remaining / SUBAGENT_SESSION_TTL_MS));
+  const colorClass = ratio <= 0.2
+    ? styles.sessionCountdownDanger
+    : ratio <= 0.5
+      ? styles.sessionCountdownWarn
+      : styles.sessionCountdownSafe;
+  const radius = 6;
+  const circumference = 2 * Math.PI * radius;
+  const dashOffset = circumference * (1 - ratio);
+  const minutes = Math.ceil(remaining / 60000);
+
+  return (
+    <span className={`${styles.sessionCountdown} ${colorClass}`} title={`${minutes} 分钟后自动删除`} aria-label={`${minutes} 分钟后自动删除`}>
+      <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
+        <circle className={styles.sessionCountdownTrack} cx="8" cy="8" r={radius} />
+        <circle
+          className={styles.sessionCountdownValue}
+          cx="8"
+          cy="8"
+          r={radius}
+          strokeDasharray={circumference}
+          strokeDashoffset={dashOffset}
+        />
+      </svg>
+    </span>
+  );
+});
+
+const AgentPairBadge = memo(function AgentPairBadge({ requesterAgentId, requesterAgentName, executorAgentId, executorAgentName, agents }: {
+  requesterAgentId: string | null;
+  requesterAgentName: string | null;
+  executorAgentId: string | null;
+  executorAgentName: string | null;
+  agents: Agent[];
+}) {
+  return (
+    <span className={styles.sessionAgentPairBadge} title={`${requesterAgentName || requesterAgentId || 'Agent'} ↔ ${executorAgentName || executorAgentId || 'Agent'}`}>
+      {requesterAgentId && (
+        <AgentBadge agentId={requesterAgentId} agentName={requesterAgentName} agents={agents} />
+      )}
+      <span className={styles.sessionAgentPairArrow}>↔</span>
+      {executorAgentId && (
+        <AgentBadge agentId={executorAgentId} agentName={executorAgentName} agents={agents} />
+      )}
+    </span>
+  );
+});
 
 const AgentBadge = memo(function AgentBadge({ agentId, agentName, agents }: {
   agentId: string;

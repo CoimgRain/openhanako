@@ -20,6 +20,7 @@ import {
   loadLatestAssistantSummaryFromSessionFile,
   isValidSessionPath,
   isActiveSessionPath,
+  isSubagentSessionPath,
 } from "../../core/message-utils.js";
 import {
   loadLatestTodosFromSessionFile,
@@ -281,6 +282,18 @@ export function createSessionsRoute(engine, hub = null) {
           modelProvider: s.modelProvider || null,
           pinnedAt: s.pinnedAt || null,
           hasSummary: !!summaryRecord,
+          kind: s.kind || null,
+          collaborationKind: s.collaborationKind || null,
+          readOnly: s.readOnly === true,
+          requesterAgentId: s.requesterAgentId || null,
+          requesterAgentName: s.requesterAgentName || null,
+          executorAgentId: s.executorAgentId || null,
+          executorAgentName: s.executorAgentName || null,
+          requestedAgentId: s.requestedAgentId || null,
+          requestedAgentName: s.requestedAgentName || null,
+          parentSessionPath: s.parentSessionPath || null,
+          taskId: s.taskId || null,
+          taskTitle: s.taskTitle || null,
           rcAttachment: rcAttachmentByPath.get(s.path)
             ? {
               ...rcAttachmentByPath.get(s.path),
@@ -781,6 +794,65 @@ export function createSessionsRoute(engine, hub = null) {
     await bm.closeBrowserForSession(sessionPath);
     hub?.eventBus?.emit?.({ type: "browser_status", running: false, url: null }, sessionPath);
     return c.json({ ok: true, sessions: bm.getBrowserSessionStates() });
+  });
+
+  // 点开只读 subagent 内部对话时重置 10 分钟自动删除计时
+  route.post("/sessions/subagent/touch", async (c) => {
+    try {
+      const requestContext = createRequestContext(c, engine);
+      const body = await safeJson(c);
+      const { path: sessionPath } = body;
+      if (!sessionPath) {
+        return c.json({ error: t("error.missingParam", { param: "path" }) }, 400);
+      }
+      if (!isValidSessionPath(sessionPath, engine.agentsDir) || !isSubagentSessionPath(sessionPath, engine.agentsDir)) {
+        return c.json({ error: "Invalid session path" }, 403);
+      }
+      const auth = authorizeSessionRoute(requestContext, "sessions.write", {
+        kind: "session",
+        studioId: requestContext.studioId,
+        sessionPath,
+      });
+      if (!auth.allowed) return c.json({ error: "insufficient_scope", reason: auth.reason }, 403);
+      const touchedAt = await engine.touchSubagentSession(sessionPath);
+      return c.json({ ok: true, modified: touchedAt.toISOString() });
+    } catch (err) {
+      return c.json({ error: err.message }, 500);
+    }
+  });
+
+  // 删除只读 subagent 内部对话
+  route.post("/sessions/subagent/delete", async (c) => {
+    try {
+      const requestContext = createRequestContext(c, engine);
+      const body = await safeJson(c);
+      const { path: sessionPath } = body;
+      if (!sessionPath) {
+        return c.json({ error: t("error.missingParam", { param: "path" }) }, 400);
+      }
+      if (!isValidSessionPath(sessionPath, engine.agentsDir) || !isSubagentSessionPath(sessionPath, engine.agentsDir)) {
+        return c.json({ error: "Invalid session path" }, 403);
+      }
+      const auth = authorizeSessionRoute(requestContext, "sessions.write", {
+        kind: "session",
+        studioId: requestContext.studioId,
+        sessionPath,
+      });
+      if (!auth.allowed) return c.json({ error: "insufficient_scope", reason: auth.reason }, 403);
+
+      try {
+        await engine.deleteSubagentSession(sessionPath, { skipStreamingCheck: true });
+      } catch (err) {
+        if (err?.message === "session_busy") {
+          return c.json({ error: "session_busy" }, 409);
+        }
+        throw err;
+      }
+      invalidateRcTarget(sessionPath);
+      return c.json({ ok: true });
+    } catch (err) {
+      return c.json({ error: err.message }, 500);
+    }
   });
 
   // 重命名 session
