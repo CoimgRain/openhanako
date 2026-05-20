@@ -134,7 +134,7 @@ export function ChannelMessages() {
 
     previousChannelRef.current = currentChannel;
     previousLengthRef.current = messages.length;
-  }, [currentChannel, getScrollContainer, messages.length, scrollToBottom]);
+  }, [currentChannel, getScrollContainer, messages, scrollToBottom]);
 
   if (!currentChannel || messages.length === 0) {
     return <div className={styles.channelWelcome}>{t('channel.noMessages')}</div>;

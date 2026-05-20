@@ -555,7 +555,7 @@ export function handleServerMessage(msg: any): void {
 
     case 'channel_new_message': {
       const store = useStore.getState();
-      const isViewing = store.currentTab === 'channels' && store.currentChannel === msg.channelName && document.visibilityState === 'visible';
+      const isViewing = store.currentTab === 'channels' && store.currentChannel === msg.channelName;
       if (msg.channelName && isViewing && msg.message) {
         appendChannelMessageAction(msg.channelName, msg.message);
       } else if (msg.channelName && isViewing) {
@@ -574,7 +574,7 @@ export function handleServerMessage(msg: any): void {
         break;
       }
       const dmId = `dm:${peerId}`;
-      const isViewingDM = store2.currentTab === 'channels' && store2.currentChannel === dmId && document.visibilityState === 'visible';
+      const isViewingDM = store2.currentTab === 'channels' && store2.currentChannel === dmId;
       if (isViewingDM) {
         openChannelAction(dmId, true);
       } else {
