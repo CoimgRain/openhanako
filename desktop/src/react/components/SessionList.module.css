@@ -37,6 +37,15 @@
     background: var(--accent-light);
 }
 
+.sessionItemChild {
+    width: calc(100% - 10px);
+    margin-left: 10px;
+}
+
+.sessionItemReadOnly {
+    --session-item-readonly: 1;
+}
+
 .sessionItemTitle {
     font-size: 0.8rem;
     color: var(--text);
@@ -45,6 +54,7 @@
     text-overflow: ellipsis;
     white-space: nowrap;
     min-width: 0;
+    flex: 1 1 auto;
 }
 
 .sessionItemActive .sessionItemTitle {
@@ -63,8 +73,37 @@
     transition: padding-right var(--duration-fast);
 }
 
+.sessionItemMetaSep {
+    opacity: 0.9;
+}
+
+.sessionTaskDuration {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 4px;
+}
+
+.sessionTaskDurationTime {
+    display: inline-block;
+    width: 5ch;
+    font-family: var(--font-mono, "SFMono-Regular", "SF Mono", Consolas, monospace);
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: "tnum";
+    text-align: left;
+}
+
+.sessionRelativeTime {
+    font-family: var(--font-mono, "SFMono-Regular", "SF Mono", Consolas, monospace);
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: "tnum";
+}
+
+.sessionItemMetaCollaboration {
+    margin-left: 18px;
+}
+
 @media (hover: hover) and (pointer: fine) {
-    .sessionItem:hover .sessionItemMeta {
+    .sessionItem:not(.sessionItemReadOnly):hover .sessionItemMeta {
         padding-right: 68px;
     }
 }
@@ -223,7 +262,7 @@
     }
 }
 
-.sessionItemActive .sessionItemMeta,
+.sessionItemActive:not(.sessionItemReadOnly) .sessionItemMeta,
 .sessionItem:focus-visible .sessionItemMeta {
     padding-right: 68px;
 }
@@ -236,16 +275,6 @@
 .sessionItem:focus-visible .sessionArchiveBtn {
     opacity: 0.5;
     pointer-events: auto;
-}
-
-/* streaming 呼吸动画 */
-.sessionStreamingDot {
-    width: 5px;
-    height: 5px;
-    border-radius: 50%;
-    background: var(--accent, #b89a7a);
-    flex-shrink: 0;
-    animation: hana-pulse 2s ease-in-out infinite;
 }
 
 /* 浏览器标记 */
@@ -296,11 +325,15 @@
     pointer-events: none;
 }
 
-.sessionAgentPairArrow {
+.sessionDelegationArrow {
+    width: 16px;
+    height: 16px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
     color: var(--text-muted);
-    font-size: 0.58rem;
-    line-height: 1;
-    opacity: 0.78;
+    flex-shrink: 0;
+    opacity: 0.72;
 }
 
 .sessionAgentBadgeText {
@@ -451,10 +484,30 @@
     transform: rotate(-90deg);
 }
 
+.sessionCountdownCheck {
+    position: absolute;
+    inset: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    color: currentColor;
+}
+
+.sessionCountdownDone .sessionCountdownCheck {
+    opacity: 0;
+    transform: scale(0.62);
+    animation: hana-subagent-check-pop 180ms ease-out 520ms forwards;
+}
+
+.sessionCountdownCheck svg {
+    transform: none;
+}
+
 .sessionCountdownTrack,
-.sessionCountdownValue {
+.sessionCountdownValue,
+.sessionCountdownSpinner {
     fill: none;
-    stroke-width: 2;
+    stroke-width: 1.6;
 }
 
 .sessionCountdownTrack {
@@ -467,6 +520,35 @@
     transition: stroke-dashoffset 1s linear, color var(--duration-fast);
 }
 
+.sessionCountdownSpinner {
+    stroke: currentColor;
+    stroke-linecap: round;
+}
+
+.sessionCountdownRunning {
+    color: var(--accent);
+}
+
+.sessionCountdownRunning svg {
+    animation: hana-subagent-ring-spin 900ms linear infinite;
+}
+
+.sessionCountdownDone > svg {
+    animation: hana-subagent-complete-spin 560ms cubic-bezier(0.2, 0.72, 0.18, 1) both;
+}
+
+.sessionCountdownDismissing {
+    animation: hana-session-check-dismiss-fade 560ms ease-in forwards;
+}
+
+.sessionCountdownDismissing > svg {
+    animation: hana-session-check-dismiss-spin 560ms cubic-bezier(0.2, 0.72, 0.18, 1) forwards;
+}
+
+.sessionCountdownDismissing .sessionCountdownCheck {
+    animation: hana-session-check-dismiss-check 180ms ease-in forwards;
+}
+
 .sessionCountdownSafe {
     color: var(--accent);
 }
@@ -477,4 +559,72 @@
 
 .sessionCountdownDanger {
     color: var(--danger);
+}
+
+@keyframes hana-subagent-ring-spin {
+    from {
+        transform: rotate(-90deg);
+    }
+    to {
+        transform: rotate(270deg);
+    }
+}
+
+@keyframes hana-subagent-complete-spin {
+    from {
+        transform: rotate(-90deg);
+    }
+    to {
+        transform: rotate(270deg);
+    }
+}
+
+@keyframes hana-subagent-check-pop {
+    0% {
+        opacity: 0;
+        transform: scale(0.62);
+    }
+    72% {
+        opacity: 1;
+        transform: scale(1.14);
+    }
+    100% {
+        opacity: 1;
+        transform: scale(1);
+    }
+}
+
+@keyframes hana-session-check-dismiss-fade {
+    0% {
+        opacity: 1;
+        transform: scale(1);
+    }
+    68% {
+        opacity: 1;
+        transform: scale(1);
+    }
+    100% {
+        opacity: 0;
+        transform: scale(0.86);
+    }
+}
+
+@keyframes hana-session-check-dismiss-spin {
+    from {
+        transform: rotate(-90deg);
+    }
+    to {
+        transform: rotate(270deg);
+    }
+}
+
+@keyframes hana-session-check-dismiss-check {
+    from {
+        opacity: 1;
+        transform: scale(1);
+    }
+    to {
+        opacity: 0;
+        transform: scale(0.72);
+    }
 }

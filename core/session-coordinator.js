@@ -47,12 +47,27 @@ import {
   snapshotSkillsForSession,
 } from "../lib/skills/session-skill-snapshot.js";
 import { SessionListProjectionCache } from "./session-list-projection-cache.js";
-import { deleteSubagentSessionMeta } from "../lib/subagent-executor-metadata.js";
+import {
+  archiveSubagentSessionMeta,
+  deleteSubagentSessionMeta,
+  readSubagentSessionMetaSync,
+} from "../lib/subagent-executor-metadata.js";
 import { deleteSessionFileSidecarSync } from "../lib/session-files/session-file-registry.js";
 import { deleteSessionSkillSnapshotSync } from "../lib/skills/session-skill-snapshot.js";
 
 const log = createModuleLogger("session");
 const SUBAGENT_IDLE_DELETE_MS = 10 * 60 * 1000;
+
+function mapSubagentRunStatusForList(runStatus) {
+  if (runStatus === "pending") return "running";
+  if (runStatus === "resolved") return "done";
+  if (runStatus === "failed") return "failed";
+  if (runStatus === "aborted") return "aborted";
+  if (runStatus === "running" || runStatus === "recovering" || runStatus === "blocked" || runStatus === "paused") return "running";
+  if (runStatus === "completed") return "done";
+  if (runStatus === "canceled") return "aborted";
+  return null;
+}
 
 
 /** 巡检/定时任务默认工具白名单（"*" = 与 chat 一致，全部放行） */
@@ -360,10 +375,10 @@ export class SessionCoordinator {
 
   // ── Session 创建 / 切换 ──
 
-  async _shouldIncludeLegacyArtifactToolForRestore(agent, sessionPath) {
+  async _shouldIncludeLegacyArtifactToolForRestore(_agent, sessionPath) {
     if (!sessionPath) return true;
     try {
-      const metaPath = path.join(agent.sessionDir, "session-meta.json");
+      const metaPath = this._sessionMetaPathFor(sessionPath);
       const raw = await fsp.readFile(metaPath, "utf-8");
       const meta = JSON.parse(raw);
       const metaEntry = meta[path.basename(sessionPath)];
@@ -408,11 +423,11 @@ export class SessionCoordinator {
       sessionMgr = SessionManager.create(effectiveCwd, agent.sessionDir);
     }
     const sessionPathForMeta = sessionMgr.getSessionFile?.() || null;
+    const sessionMetaPath = sessionPathForMeta ? this._sessionMetaPathFor(sessionPathForMeta) : null;
     let restoredThinkingLevel = null;
     if (restore && sessionPathForMeta) {
       try {
-        const metaPath = path.join(agent.sessionDir, "session-meta.json");
-        const meta = await this._readMetaCached(metaPath);
+        const meta = await this._readMetaCached(sessionMetaPath);
         const metaEntry = meta[path.basename(sessionPathForMeta)];
         if (typeof metaEntry?.thinkingLevel === "string") {
           restoredThinkingLevel = metaEntry.thinkingLevel;
@@ -447,8 +462,7 @@ export class SessionCoordinator {
     });
     if (restore && sessionPathForMeta) {
       try {
-        const metaPath = path.join(agent.sessionDir, "session-meta.json");
-        const meta = await this._readMetaCached(metaPath);
+        const meta = await this._readMetaCached(sessionMetaPath);
         const restoredFolders = meta[path.basename(sessionPathForMeta)]?.workspaceFolders;
         workspaceScope = normalizeWorkspaceScope({
           primaryCwd: effectiveCwd,
@@ -470,8 +484,7 @@ export class SessionCoordinator {
     let restoredExperienceEnabled = false;
     if (restore && sessionPathForMeta) {
       try {
-        const metaPath = path.join(agent.sessionDir, "session-meta.json");
-        const meta = await this._readMetaCached(metaPath);
+        const meta = await this._readMetaCached(sessionMetaPath);
         restoredExperienceEnabled = meta[path.basename(sessionPathForMeta)]?.experienceEnabled === true;
       } catch (err) {
         if (err.code !== "ENOENT") {
@@ -495,8 +508,7 @@ export class SessionCoordinator {
     let restoredPermissionMode = null;
     if (restore && sessionPathForMeta) {
       try {
-        const metaPath = path.join(agent.sessionDir, "session-meta.json");
-        const meta = await this._readMetaCached(metaPath);
+        const meta = await this._readMetaCached(sessionMetaPath);
         const metaEntry = meta[path.basename(sessionPathForMeta)];
         if (metaEntry) {
           restoredPermissionMode = normalizeSessionPermissionMode(metaEntry);
@@ -684,8 +696,7 @@ export class SessionCoordinator {
     this._sessionStarted = false;
     if (restore && sessionPath && restoredPermissionMode === null) {
       try {
-        const metaPath = path.join(agent.sessionDir, "session-meta.json");
-        const meta = await this._readMetaCached(metaPath);
+        const meta = await this._readMetaCached(this._sessionMetaPathFor(sessionPath));
         const metaEntry = meta[path.basename(sessionPath)];
         if (metaEntry) {
           initialPermissionMode = normalizeSessionPermissionMode(metaEntry);
@@ -752,7 +763,7 @@ export class SessionCoordinator {
 
     if (restore) {
       if (sessionPath) {
-        const metaPathForRestore = path.join(agent.sessionDir, "session-meta.json");
+        const metaPathForRestore = this._sessionMetaPathFor(sessionPath);
         let metaEntry = null;
         try {
           const raw = await fsp.readFile(metaPathForRestore, "utf-8");
@@ -1876,10 +1887,15 @@ export class SessionCoordinator {
       return existing.session;
     }
 
-    const targetAgentId = this._d.agentIdFromSessionPath(sessionPath);
-    if (!targetAgentId) {
+    const ownerAgentId = this._d.agentIdFromSessionPath(sessionPath);
+    if (!ownerAgentId) {
       throw new Error(`ensureSessionLoaded: cannot resolve agentId for ${sessionPath}`);
     }
+    const subagentSession = isSubagentSessionPath(sessionPath, this._d.agentsDir);
+    const subagentMeta = subagentSession ? readSubagentSessionMetaSync(sessionPath) : null;
+    const targetAgentId = subagentSession
+      ? (subagentMeta?.executorAgentId || ownerAgentId)
+      : ownerAgentId;
     const agent = this._d.getAgentById(targetAgentId);
     if (!agent) {
       throw new Error(`ensureSessionLoaded: agent "${targetAgentId}" not found`);
@@ -1888,7 +1904,7 @@ export class SessionCoordinator {
     // memoryEnabled 从 meta 恢复（跟 switchSession 同一份 meta 数据源）
     let memoryEnabled = true;
     try {
-      const metaPath = path.join(agent.sessionDir, "session-meta.json");
+      const metaPath = this._sessionMetaPathFor(sessionPath);
       const meta = await this._readMetaCached(metaPath);
       const sessKey = path.basename(sessionPath);
       if (meta[sessKey]?.memoryEnabled === false) memoryEnabled = false;
@@ -1906,7 +1922,10 @@ export class SessionCoordinator {
     try {
       // #521: attach 路径同样要做健康度评估，否则 bridge / RC 自动恢复时也会反复失败
       this._emitSessionHealthWarning(sessionPath);
-      const sessionMgr = SessionManager.open(sessionPath, agent.sessionDir);
+      const sessionMgr = SessionManager.open(
+        sessionPath,
+        subagentSession ? path.dirname(sessionPath) : agent.sessionDir,
+      );
       const cwd = sessionMgr.getCwd?.() || undefined;
       await this.createSession(sessionMgr, cwd, memoryEnabled, null, {
         restore: true,
@@ -1991,14 +2010,16 @@ export class SessionCoordinator {
         await fsp.access(subagentDir);
         const [subagentSessions, subagentMeta] = await Promise.all([
           this._sessionListProjectionCache.list(subagentDir),
-          this._readMetaCached(path.join(subagentDir, "session-meta.json")),
+          this._readMetaCached(path.join(subagentDir, "session-meta.json"), { bypassCache: true }),
         ]);
         for (const s of subagentSessions) {
-          if (await this._shouldAutoDeleteSubagentSession(s)) {
-            await this.deleteSubagentSession(s.path, { skipStreamingCheck: true });
+          const meta = subagentMeta[path.basename(s.path)] || {};
+          if (meta.archivedAt) continue;
+          const subagentStatus = this._resolveSubagentSessionStatus(s.path, meta, s);
+          if (await this._shouldAutoDeleteSubagentSession(s, subagentStatus)) {
+            await this.deleteSubagentSession(s.path);
             continue;
           }
-          const meta = subagentMeta[path.basename(s.path)] || {};
           const requesterAgentId = meta.requesterAgentId || meta.parentAgentId || agent.id;
           const requesterAgentName = agentNameFor(
             requesterAgentId,
@@ -2010,6 +2031,8 @@ export class SessionCoordinator {
             meta.executorAgentNameSnapshot || meta.agentName,
           );
           const taskTitle = meta.taskTitle || meta.taskSummary || s.firstMessage || "";
+          const taskId = meta.taskId || null;
+          const subagentRun = taskId ? this._getSubagentRunStore()?.query?.(taskId) || null : null;
           s.kind = "subagent";
           s.collaborationKind = "subagent";
           s.readOnly = true;
@@ -2024,8 +2047,12 @@ export class SessionCoordinator {
           s.requestedAgentId = meta.requestedAgentId || null;
           s.requestedAgentName = meta.requestedAgentNameSnapshot || null;
           s.parentSessionPath = meta.parentSessionPath || s.parentSessionPath || null;
-          s.taskId = meta.taskId || null;
+          s.taskId = taskId;
           s.taskTitle = taskTitle || null;
+          s.subagentStatus = subagentStatus;
+          s.subagentStartedAt = subagentRun?.createdAt
+            || (s.created instanceof Date ? s.created.toISOString() : null);
+          s.subagentCompletedAt = subagentRun?.completedAt || null;
           s.pinnedAt = null;
           visibleSessions.push(s);
         }
@@ -2072,11 +2099,67 @@ export class SessionCoordinator {
     return allSessions;
   }
 
-  async _shouldAutoDeleteSubagentSession(sessionProjection) {
+  _getSubagentRunStore() {
+    return this._d.getSubagentRunStore?.() || this._d.getEngine?.()?.subagentRuns || null;
+  }
+
+  _getDeferredResultStore() {
+    return this._d.getDeferredResultStore?.() || this._d.getEngine?.()?.deferredResults || null;
+  }
+
+  _getTaskRegistry() {
+    return this._d.getTaskRegistry?.() || this._d.getEngine?.()?.taskRegistry || null;
+  }
+
+  _resolveSubagentSessionStatus(sessionPath, meta = {}, sessionProjection = null) {
+    if (this.isSessionStreaming(sessionPath)) return "running";
+
+    const taskId = typeof meta?.taskId === "string" && meta.taskId ? meta.taskId : null;
+    let terminalStatus = null;
+
+    if (taskId) {
+      const task = this._getTaskRegistry()?.query?.(taskId) || null;
+      const taskStatus = mapSubagentRunStatusForList(task?.status);
+      if (taskStatus === "running") return "running";
+      if (taskStatus) terminalStatus = taskStatus;
+
+      const deferred = this._getDeferredResultStore()?.query?.(taskId) || null;
+      const deferredStatus = mapSubagentRunStatusForList(deferred?.status);
+      if (deferredStatus === "running") return "running";
+      if (deferredStatus) terminalStatus = deferredStatus;
+
+      const run = this._getSubagentRunStore()?.query?.(taskId) || null;
+      const runStatus = mapSubagentRunStatusForList(run?.status);
+      if (runStatus === "running") return "running";
+      if (runStatus) terminalStatus = runStatus;
+    }
+
+    if (!terminalStatus && sessionPath) {
+      const run = this._getSubagentRunStore()?.list?.()
+        ?.find?.((item) => item?.childSessionPath === sessionPath) || null;
+      const runStatus = mapSubagentRunStatusForList(run?.status);
+      if (runStatus === "running") return "running";
+      if (runStatus) terminalStatus = runStatus;
+    }
+
+    if (terminalStatus) return terminalStatus;
+
+    // 没有任何活跃任务记录，但子会话已经出现 assistant 输出，说明不是“仍在思考”，应进入完成态。
+    if ((sessionProjection?.messageCount || 0) > 1) return "done";
+
+    // 如果有 taskId 且还没有 assistant 输出或终态记录，宁可继续显示执行中，避免模型思考中提前显示完成。
+    if (taskId) return "running";
+
+    // 老版本 subagent 投影没有 taskId / durable run 记录；只要不在 streaming，就沿用旧行为视为已完成。
+    return "done";
+  }
+
+  async _shouldAutoDeleteSubagentSession(sessionProjection, subagentStatus = null) {
     const sessionPath = sessionProjection?.path;
-    if (!sessionPath || sessionPath === this.currentSessionPath) return false;
+    if (!sessionPath) return false;
     if (!isSubagentSessionPath(sessionPath, this._d.agentsDir)) return false;
     if (this.isSessionStreaming(sessionPath)) return false;
+    if (subagentStatus === "running") return false;
     const modified = sessionProjection.modified instanceof Date
       ? sessionProjection.modified.getTime()
       : new Date(sessionProjection.modified || 0).getTime();
@@ -2120,6 +2203,53 @@ export class SessionCoordinator {
       this._session = null;
       this._sessionStarted = false;
     }
+  }
+
+  async deleteSubagentChildrenForParentSession(parentSessionPath, { skipStreamingCheck = true } = {}) {
+    if (!parentSessionPath) return [];
+    const sessions = await this.listSessions();
+    const childPaths = sessions
+      .filter((session) => (
+        session?.readOnly === true
+        && (session.kind === "subagent" || session.collaborationKind === "subagent")
+        && session.parentSessionPath === parentSessionPath
+        && typeof session.path === "string"
+        && isSubagentSessionPath(session.path, this._d.agentsDir)
+      ))
+      .map((session) => session.path);
+
+    const deleted = [];
+    for (const childPath of childPaths) {
+      await this.deleteSubagentSession(childPath, { skipStreamingCheck });
+      deleted.push(childPath);
+    }
+    return deleted;
+  }
+
+  async archiveSubagentSession(sessionPath) {
+    if (!isSubagentSessionPath(sessionPath, this._d.agentsDir)) {
+      throw new Error(`archiveSubagentSession: path must be in agents/{id}/subagent-sessions/ — got ${sessionPath}`);
+    }
+    if (this.isSessionStreaming(sessionPath)) {
+      throw new Error("session_busy");
+    }
+
+    try { await this.closeSession(sessionPath); } catch {}
+    const archivedAt = await archiveSubagentSessionMeta(sessionPath);
+    const metaPath = path.join(path.dirname(sessionPath), "session-meta.json");
+    this._sessionListProjectionCache.invalidate(path.dirname(sessionPath));
+    this._metaCache.delete(metaPath);
+    this._sessions.delete(sessionPath);
+    this._hibernatedSessionMeta.delete(sessionPath);
+    this._clearRuntimePressureTimer(sessionPath);
+
+    if (this._currentSessionPath === sessionPath) {
+      this._currentSessionPath = null;
+      this._session = null;
+      this._sessionStarted = false;
+    }
+
+    return archivedAt;
   }
 
   async saveSessionTitle(sessionPath, title) {
@@ -2261,9 +2391,10 @@ export class SessionCoordinator {
   }
 
   /** 异步读取 session-meta.json，带 TTL 缓存 */
-  async _readMetaCached(metaPath) {
+  async _readMetaCached(metaPath, { bypassCache = false } = {}) {
+    if (!metaPath) return {};
     const cached = this._metaCache.get(metaPath);
-    if (cached && Date.now() - cached.ts < SessionCoordinator._TITLES_TTL) {
+    if (!bypassCache && cached && Date.now() - cached.ts < SessionCoordinator._TITLES_TTL) {
       return cached.data;
     }
     try {
@@ -2276,9 +2407,9 @@ export class SessionCoordinator {
     }
   }
 
-  async _readSessionPromptSnapshot(agent, sessionPath) {
+  async _readSessionPromptSnapshot(_agent, sessionPath) {
     try {
-      const metaPath = path.join(agent.sessionDir, "session-meta.json");
+      const metaPath = this._sessionMetaPathFor(sessionPath);
       const meta = await this._readMetaCached(metaPath);
       return normalizePromptSnapshot(meta[path.basename(sessionPath)]?.promptSnapshot);
     } catch {
@@ -2376,6 +2507,9 @@ export class SessionCoordinator {
   }
 
   _sessionMetaPathFor(sessionPath) {
+    if (isSubagentSessionPath(sessionPath, this._d.agentsDir)) {
+      return path.join(path.dirname(sessionPath), "session-meta.json");
+    }
     const agentId = this._d.agentIdFromSessionPath(sessionPath);
     const sessionDir = agentId
       ? path.join(this._d.agentsDir, agentId, "sessions")
@@ -2504,10 +2638,20 @@ export class SessionCoordinator {
       const models = this._d.getModels();
       // migration #5 之后 models.chat 必为 {id, provider}；旧裸字符串/缺 provider 对象视为未配置
       const agentPreferredRef = targetAgent.config?.models?.chat;
-      const preferredRef = opts.model ? null
-        : ((typeof agentPreferredRef === "object" && agentPreferredRef?.id && agentPreferredRef?.provider)
-            ? agentPreferredRef : null);
-      let resolvedModel = opts.model;
+      const preferredRef = (typeof agentPreferredRef === "object" && agentPreferredRef?.id && agentPreferredRef?.provider)
+        ? agentPreferredRef
+        : null;
+      let resolvedModel = null;
+      if (opts.model) {
+        try {
+          resolvedModel = models.resolveExecutionModel(opts.model);
+        } catch (err) {
+          const requestedId = typeof opts.model === "object" && opts.model?.id
+            ? `${opts.model.provider ? `${opts.model.provider}/` : ""}${opts.model.id}`
+            : String(opts.model);
+          log.warn(`[executeIsolated] 请求模型 "${requestedId}" 不可用，回退到 agent/default 模型: ${err.message}`);
+        }
+      }
       if (!resolvedModel) {
         if (preferredRef) {
           resolvedModel = findModel(models.availableModels, preferredRef.id, preferredRef.provider);

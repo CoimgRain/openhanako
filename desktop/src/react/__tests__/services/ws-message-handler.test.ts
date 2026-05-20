@@ -427,6 +427,42 @@ describe('ws-message-handler background chat stream routing', () => {
       },
     });
   });
+
+  it('子任务重新收到 running block_update 时清掉旧 completedAt，避免侧边栏提前打勾', () => {
+    useStore.setState({
+      sessions: [{
+        path: '/session/subagent.jsonl',
+        title: '内部对话',
+        firstMessage: '仍在整理的任务',
+        modified: '2026-04-24T10:02:00.000Z',
+        messageCount: 2,
+        agentId: 'agent-b',
+        agentName: '小库',
+        cwd: null,
+        readOnly: true,
+        kind: 'subagent',
+        collaborationKind: 'subagent',
+        taskId: 'subagent-running',
+        subagentStatus: 'done',
+        subagentCompletedAt: '2026-04-24T10:03:00.000Z',
+      }],
+    } as never);
+
+    handleServerMessage({
+      type: 'block_update',
+      sessionPath: '/session/parent.jsonl',
+      taskId: 'subagent-running',
+      patch: {
+        streamKey: '/session/subagent.jsonl',
+        streamStatus: 'running',
+      },
+    });
+
+    expect(useStore.getState().sessions[0]).toMatchObject({
+      subagentStatus: 'running',
+      subagentCompletedAt: null,
+    });
+  });
 });
 
 describe('ws-message-handler compaction lifecycle', () => {

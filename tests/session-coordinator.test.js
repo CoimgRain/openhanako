@@ -1591,6 +1591,78 @@ describe("SessionCoordinator", () => {
     expect(fs.existsSync(sessionFile)).toBe(false);
   });
 
+  it("executeIsolated falls back when a subagent supplies an unavailable model", async () => {
+    const sessionFile = path.join(tempDir, "isolated-model-fallback.jsonl");
+    const fallbackModel = { id: "deepseek-v4-flash", provider: "opencode", name: "DeepSeek V4 Flash" };
+    const resolveExecutionModel = vi.fn((modelRef) => {
+      if (!modelRef) return fallbackModel;
+      if (typeof modelRef === "string") {
+        if (modelRef === "opencode/deepseek-v4-flash") return fallbackModel;
+        throw new Error(`找不到模型: ${modelRef}`);
+      }
+      if (modelRef?.id === fallbackModel.id && modelRef?.provider === fallbackModel.provider) return fallbackModel;
+      throw new Error(`找不到模型: ${modelRef?.provider || ""}/${modelRef?.id || ""}`);
+    });
+
+    sessionManagerCreateMock.mockReturnValue({
+      getCwd: () => tempDir,
+      getSessionFile: () => sessionFile,
+    });
+    createAgentSessionMock.mockResolvedValue({
+      session: {
+        sessionManager: { getSessionFile: () => sessionFile },
+        subscribe: vi.fn(() => vi.fn()),
+        prompt: vi.fn(async () => {}),
+        abort: vi.fn(),
+      },
+    });
+
+    const agent = {
+      id: "hana",
+      agentDir: tempDir,
+      sessionDir: tempDir,
+      agentName: "test-agent",
+      config: { models: { chat: { id: "deepseek-v4-flash", provider: "opencode" } } },
+      systemPrompt: "prompt",
+      tools: [],
+    };
+    const coordinator = new SessionCoordinator({
+      agentsDir: "/tmp/agents",
+      getAgent: () => agent,
+      getActiveAgentId: () => "hana",
+      getModels: () => ({
+        authStorage: {},
+        modelRegistry: {},
+        defaultModel: fallbackModel,
+        availableModels: [fallbackModel],
+        resolveExecutionModel,
+        resolveThinkingLevel: () => "medium",
+      }),
+      getResourceLoader: () => ({ getSystemPrompt: () => "prompt" }),
+      getSkills: () => ({ getSkillsForAgent: () => [] }),
+      buildTools: () => ({ tools: [], customTools: [] }),
+      emitEvent: () => {},
+      getHomeCwd: () => tempDir,
+      agentIdFromSessionPath: () => null,
+      switchAgentOnly: async () => {},
+      getConfig: () => ({}),
+      getPrefs: () => ({ getThinkingLevel: () => "medium" }),
+      getAgents: () => new Map(),
+      getActivityStore: () => null,
+      getAgentById: () => null,
+      listAgents: () => [],
+    });
+
+    await coordinator.executeIsolated("subagent task", {
+      model: "deepseek/deepseek-chat",
+      subagentContext: false,
+    });
+
+    expect(createAgentSessionMock.mock.calls[0][0].model).toEqual(fallbackModel);
+    expect(resolveExecutionModel).toHaveBeenCalledWith("deepseek/deepseek-chat");
+    expect(resolveExecutionModel).toHaveBeenCalledWith(fallbackModel);
+  });
+
   it("releases a streaming session immediately when the provider abort never settles", async () => {
     const sessionFile = path.join(tempDir, "stuck-stream.jsonl");
     const emitEvent = vi.fn();
@@ -2282,7 +2354,127 @@ describe("SessionCoordinator", () => {
     expect(sessions.find((item) => item.path === childPath)).toBeUndefined();
     expect(fs.existsSync(childPath)).toBe(false);
     const meta = JSON.parse(fs.readFileSync(path.join(subagentDir, "session-meta.json"), "utf-8"));
-    expect(meta["old-child.jsonl"]).toBeUndefined();
+    expect(meta).not.toHaveProperty("old-child.jsonl");
+  });
+
+  it("keeps idle pending subagent projections visible and marks them running", async () => {
+    const agentsDir = path.join(tempDir, "agents");
+    const agentDir = path.join(agentsDir, "hanako");
+    const subagentDir = path.join(agentDir, "subagent-sessions");
+    fs.mkdirSync(subagentDir, { recursive: true });
+    const childPath = path.join(subagentDir, "pending-child.jsonl");
+    const oldIso = new Date(Date.now() - 11 * 60 * 1000).toISOString();
+    fs.writeFileSync(childPath, [
+      JSON.stringify({ type: "session", id: "pending-child", timestamp: oldIso, cwd: "/tmp/work" }),
+      JSON.stringify({ type: "message", id: "u1", timestamp: oldIso, message: { role: "user", content: "旧任务" } }),
+      JSON.stringify({ type: "message", id: "a1", timestamp: oldIso, message: { role: "assistant", content: "正在整理中" } }),
+      "",
+    ].join("\n"));
+    fs.writeFileSync(path.join(subagentDir, "session-meta.json"), JSON.stringify({
+      "pending-child.jsonl": {
+        taskId: "subagent-pending-1",
+        executorAgentId: "agent-b",
+        executorAgentNameSnapshot: "小库",
+      },
+    }, null, 2));
+
+    const coordinator = new SessionCoordinator({
+      agentsDir,
+      getAgent: () => ({ agentName: "小颜", sessionDir: path.join(agentDir, "sessions") }),
+      getActiveAgentId: () => "hanako",
+      getModels: () => ({ authStorage: {}, modelRegistry: {}, resolveThinkingLevel: () => "medium" }),
+      getResourceLoader: () => ({ getSystemPrompt: () => "BASE" }),
+      getSkills: () => null,
+      buildTools: () => ({ tools: [], customTools: [] }),
+      emitEvent: () => {},
+      getHomeCwd: () => tempDir,
+      agentIdFromSessionPath: () => "hanako",
+      switchAgentOnly: async () => {},
+      getConfig: () => ({}),
+      getPrefs: () => ({ getThinkingLevel: () => "medium" }),
+      getAgents: () => new Map(),
+      getActivityStore: () => null,
+      getAgentById: () => null,
+      getEngine: () => ({
+        subagentRuns: {
+          query: (taskId) => taskId === "subagent-pending-1"
+            ? { taskId, status: "pending", childSessionPath: childPath }
+            : null,
+        },
+      }),
+      listAgents: () => [{ id: "hanako", name: "小颜" }, { id: "agent-b", name: "小库" }],
+    });
+
+    const sessions = await coordinator.listSessions();
+    const child = sessions.find((item) => item.path === childPath);
+    expect(child).toMatchObject({
+      taskId: "subagent-pending-1",
+      subagentStatus: "running",
+    });
+    expect(fs.existsSync(childPath)).toBe(true);
+  });
+
+  it("deletes subagent children directly when asked to clean up a parent session", async () => {
+    const agentsDir = path.join(tempDir, "agents");
+    const agentDir = path.join(agentsDir, "hanako");
+    const sessionDir = path.join(agentDir, "sessions");
+    const subagentDir = path.join(agentDir, "subagent-sessions");
+    fs.mkdirSync(sessionDir, { recursive: true });
+    fs.mkdirSync(subagentDir, { recursive: true });
+    const parentPath = path.join(sessionDir, "parent.jsonl");
+    const childPath = path.join(subagentDir, "child.jsonl");
+    const nowIso = new Date().toISOString();
+    fs.writeFileSync(parentPath, [
+      JSON.stringify({ type: "session", id: "parent", timestamp: nowIso, cwd: "/tmp/work" }),
+      "",
+    ].join("\n"));
+    fs.writeFileSync(childPath, [
+      JSON.stringify({ type: "session", id: "child", timestamp: nowIso, cwd: "/tmp/work" }),
+      JSON.stringify({ type: "message", id: "u1", timestamp: nowIso, message: { role: "user", content: "子任务" } }),
+      "",
+    ].join("\n"));
+    fs.writeFileSync(path.join(subagentDir, "session-meta.json"), JSON.stringify({
+      "child.jsonl": {
+        taskId: "subagent-child-1",
+        parentSessionPath: parentPath,
+        executorAgentId: "agent-b",
+        executorAgentNameSnapshot: "小库",
+      },
+    }, null, 2));
+
+    const coordinator = new SessionCoordinator({
+      agentsDir,
+      getAgent: () => ({ agentName: "小颜", sessionDir }),
+      getActiveAgentId: () => "hanako",
+      getModels: () => ({ authStorage: {}, modelRegistry: {}, resolveThinkingLevel: () => "medium" }),
+      getResourceLoader: () => ({ getSystemPrompt: () => "BASE" }),
+      getSkills: () => null,
+      buildTools: () => ({ tools: [], customTools: [] }),
+      emitEvent: () => {},
+      getHomeCwd: () => tempDir,
+      agentIdFromSessionPath: () => "hanako",
+      switchAgentOnly: async () => {},
+      getConfig: () => ({}),
+      getPrefs: () => ({ getThinkingLevel: () => "medium" }),
+      getAgents: () => new Map(),
+      getActivityStore: () => null,
+      getAgentById: () => null,
+      getEngine: () => ({
+        subagentRuns: {
+          query: () => ({ taskId: "subagent-child-1", status: "resolved", childSessionPath: childPath }),
+          list: () => [],
+        },
+      }),
+      listAgents: () => [{ id: "hanako", name: "小颜" }, { id: "agent-b", name: "小库" }],
+    });
+
+    const deleted = await coordinator.deleteSubagentChildrenForParentSession(parentPath);
+
+    expect(deleted).toEqual([childPath]);
+    expect(fs.existsSync(childPath)).toBe(false);
+    const meta = JSON.parse(fs.readFileSync(path.join(subagentDir, "session-meta.json"), "utf-8"));
+    expect(meta).not.toHaveProperty("child.jsonl");
+    expect(fs.existsSync(parentPath)).toBe(true);
   });
 
   it("switchSession 拒绝 subagent-sessions/activity/.ephemeral 等旁路路径", async () => {

@@ -3,19 +3,24 @@ import type { Session } from '../types';
 export type SessionViewMode = 'time';
 export type DateGroup = 'today' | 'thisWeek' | 'earlier';
 
+export interface SessionTreeItem {
+  session: Session;
+  children: Session[];
+}
+
 export type SessionSection =
   | {
       id: 'pinned';
       kind: 'pinned';
       titleKey: 'sidebar.pinned';
-      items: Session[];
+      items: SessionTreeItem[];
     }
   | {
       id: `date:${DateGroup}`;
       kind: 'date';
       titleKey: `time.${DateGroup}`;
       group: DateGroup;
-      items: Session[];
+      items: SessionTreeItem[];
     };
 
 interface BuildSessionSectionsOptions {
@@ -59,6 +64,56 @@ function compareByPath(a: Session, b: Session): number {
   return String(a.path || '').localeCompare(String(b.path || ''));
 }
 
+function isSubagentSession(session: Session): boolean {
+  return (session.kind === 'subagent' || session.collaborationKind === 'subagent') && session.readOnly === true;
+}
+
+function compareByModifiedDesc(a: Session, b: Session): number {
+  return modifiedTime(b) - modifiedTime(a) || compareByPath(a, b);
+}
+
+function subagentCreatedTime(session: Session): number {
+  const explicit = timestamp(session.subagentStartedAt);
+  if (explicit > 0) return explicit;
+  const taskId = typeof session.taskId === 'string' ? session.taskId : '';
+  const match = /^subagent-(\d+)-/.exec(taskId);
+  if (match) {
+    const fromTaskId = Number(match[1]);
+    if (Number.isFinite(fromTaskId) && fromTaskId > 0) return fromTaskId;
+  }
+  return modifiedTime(session);
+}
+
+function compareSubagentChildrenByCreatedDesc(a: Session, b: Session): number {
+  return subagentCreatedTime(b) - subagentCreatedTime(a) || compareByPath(a, b);
+}
+
+function attachChildSessions(sessions: Session[]): SessionTreeItem[] {
+  const sessionPaths = new Set(sessions.map(session => session.path).filter(Boolean));
+  const childrenByParent = new Map<string, Session[]>();
+  const topLevel: Session[] = [];
+
+  for (const session of sessions) {
+    const parentPath = session.parentSessionPath || null;
+    if (isSubagentSession(session) && parentPath && sessionPaths.has(parentPath)) {
+      const children = childrenByParent.get(parentPath) || [];
+      children.push(session);
+      childrenByParent.set(parentPath, children);
+    } else {
+      topLevel.push(session);
+    }
+  }
+
+  for (const children of childrenByParent.values()) {
+    children.sort(compareSubagentChildrenByCreatedDesc);
+  }
+
+  return topLevel.map(session => ({
+    session,
+    children: childrenByParent.get(session.path) || [],
+  }));
+}
+
 export function buildSessionSections(
   sessions: Session[],
   options: BuildSessionSectionsOptions = {},
@@ -69,10 +124,11 @@ export function buildSessionSections(
     throw new Error(`Unsupported session view mode: ${exhaustive}`);
   }
 
-  const pinned = sessions
-    .filter(isPinnedSession)
-    .sort((a, b) => pinnedTime(b) - pinnedTime(a) || compareByPath(a, b));
-  const regular = sessions.filter(session => !isPinnedSession(session));
+  const treeItems = attachChildSessions(sessions);
+  const pinned = treeItems
+    .filter(item => isPinnedSession(item.session))
+    .sort((a, b) => pinnedTime(b.session) - pinnedTime(a.session) || compareByPath(a.session, b.session));
+  const regular = treeItems.filter(item => !isPinnedSession(item.session));
 
   const sections: SessionSection[] = [];
   sections.push({
@@ -83,18 +139,18 @@ export function buildSessionSections(
   });
 
   const now = options.now ?? new Date();
-  const dateGroups: Record<DateGroup, Session[]> = {
+  const dateGroups: Record<DateGroup, SessionTreeItem[]> = {
     today: [],
     thisWeek: [],
     earlier: [],
   };
-  for (const session of regular) {
-    dateGroups[getSessionDateGroup(session.modified, now)].push(session);
+  for (const item of regular) {
+    dateGroups[getSessionDateGroup(item.session.modified, now)].push(item);
   }
 
   // Sort within each group: newest modified first
   for (const group of DATE_GROUP_ORDER) {
-    dateGroups[group].sort((a, b) => modifiedTime(b) - modifiedTime(a) || compareByPath(a, b));
+    dateGroups[group].sort((a, b) => compareByModifiedDesc(a.session, b.session));
   }
 
   for (const group of DATE_GROUP_ORDER) {

@@ -654,9 +654,13 @@ export async function archiveSession(path: string): Promise<void> {
       return;
     }
 
+    const deletedSubagentPaths = Array.isArray(data.deletedSubagentPaths)
+      ? data.deletedSubagentPaths.filter((item: unknown): item is string => typeof item === 'string')
+      : [];
+    const affectedPaths = [path, ...deletedSubagentPaths];
     const s = useStore.getState();
-    const isCurrent = path === s.currentSessionPath;
-    clearSessionRuntimeCaches(path);
+    const isCurrent = !!s.currentSessionPath && affectedPaths.includes(s.currentSessionPath);
+    for (const affectedPath of affectedPaths) clearSessionRuntimeCaches(affectedPath);
     if (isCurrent) {
       clearChatAction();
       useStore.setState({ currentSessionPath: null });

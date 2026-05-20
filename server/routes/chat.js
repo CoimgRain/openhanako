@@ -36,9 +36,12 @@ import {
   wsClientCanReceiveEvent,
   wsClientCanSendMessage,
 } from "../ws-scope.js";
+import { isSubagentSessionPath } from "../../core/message-utils.js";
 
 /** tool_start 事件只广播这些 arg 字段，避免传输完整文件内容（同步维护：chat-render-shim.ts extractToolDetail） */
 const TOOL_ARG_SUMMARY_KEYS = ["file_path", "path", "command", "pattern", "url", "query", "key", "value", "action", "type", "schedule", "prompt", "label"];
+const SUBAGENT_HUMAN_MESSAGE_START = "<hana-subagent-human-message>";
+const SUBAGENT_HUMAN_MESSAGE_END = "</hana-subagent-human-message>";
 
 export function summarizeToolStartArgs(toolName, rawArgs, startedAt = Date.now()) {
   if (!rawArgs || typeof rawArgs !== "object") return undefined;
@@ -62,6 +65,19 @@ function extractText(content) {
     .filter(b => b.type === "text" && b.text)
     .map(b => b.text)
     .join("");
+}
+
+function wrapSubagentHumanPrompt(text) {
+  const userText = String(text || "");
+  return [
+    "[群聊参与说明]",
+    "用户已经加入这条内部 Agent 协作群聊。你是执行方 B，默认由你直接回复用户，并沿着当前子会话上下文继续推进。",
+    "请求方 A 的历史发言是背景，不要把自己伪装成 A，也不要替 A 大段发言；只有当用户明确提到 A、@A，或确实需要 A 的视角时，才用很短的方式补充 A 的立场。",
+    "",
+    SUBAGENT_HUMAN_MESSAGE_START,
+    userText,
+    SUBAGENT_HUMAN_MESSAGE_END,
+  ].join("\n");
 }
 
 function deferredResultFileBlocks(result) {
@@ -977,13 +993,20 @@ export function createChatRoute(engine, hub, { upgradeWebSocket }) {
                 wsSend(ws, { type: "error", message: "正在切换模型，请稍候", sessionPath: promptSessionPath });
                 return;
               }
+              const isSubagentGroupPrompt = isSubagentSessionPath(promptSessionPath, engine.agentsDir);
+              const displayMessage = isSubagentGroupPrompt
+                ? { ...(msg.displayMessage || {}), source: "desktop" }
+                : msg.displayMessage;
+              if (isSubagentGroupPrompt) {
+                promptText = wrapSubagentHumanPrompt(promptText);
+              }
               try {
                 await hub.send(promptText, {
                   sessionPath: promptSessionPath,
                   images: msg.images,
                   videos: msg.videos,
                   uiContext: msg.uiContext ?? null,
-                  displayMessage: msg.displayMessage,
+                  displayMessage,
                 });
               } catch (err) {
                 const isUserAbort = err.name === 'AbortError'

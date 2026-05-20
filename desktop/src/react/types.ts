@@ -49,6 +49,9 @@ export interface Session {
   parentSessionPath?: string | null;
   taskId?: string | null;
   taskTitle?: string | null;
+  subagentStatus?: 'running' | 'done' | 'failed' | 'aborted' | string | null;
+  subagentStartedAt?: string | null;
+  subagentCompletedAt?: string | null;
   rcAttachment?: {
     sessionKey: string;
     platform: string;

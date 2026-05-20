@@ -959,6 +959,49 @@ describe('session-actions', () => {
       expect((mockState.streamingSessions as string[])).toEqual([]);
       expect(mockState.currentSessionPath).toBe('/other');
     });
+
+    it('归档主 session 时同时清理由服务端直接删除的 subagent 子 session', async () => {
+      (mockState as Record<string, unknown>).currentSessionPath = '/child';
+      (mockState.chatSessions as Record<string, unknown>)['/parent'] = {
+        items: [{ type: 'message', data: { id: '1', text: 'parent' } }],
+        hasMore: false,
+        loadingMore: false,
+      };
+      (mockState.chatSessions as Record<string, unknown>)['/child'] = {
+        items: [{ type: 'message', data: { id: '2', text: 'child' } }],
+        hasMore: false,
+        loadingMore: false,
+      };
+      (mockState.sessionStreams as Record<string, unknown>)['/child'] = { isStreaming: true };
+      (mockState.streamingSessions as string[]) = ['/child'];
+
+      mockFetch.mockResolvedValueOnce(jsonResponse({ ok: true, deletedSubagentPaths: ['/child'] }));
+      mockFetch.mockResolvedValueOnce(jsonResponse([{ path: '/other' }]));
+      mockFetch.mockResolvedValueOnce(jsonResponse({
+        agentId: null,
+        cwd: '/workspace-other',
+        currentModelId: null,
+        currentModelName: null,
+        currentModelProvider: null,
+      }));
+      mockFetch.mockResolvedValueOnce(jsonResponse({
+        messages: [{ text: 'other' }], blocks: [], todos: [], hasMore: false,
+      }));
+
+      await archiveSession('/parent');
+
+      const clearSessionMock = (mockState as unknown as {
+        clearSession: ReturnType<typeof vi.fn>;
+      }).clearSession;
+      expect(clearSessionMock).toHaveBeenCalledWith('/parent');
+      expect(clearSessionMock).toHaveBeenCalledWith('/child');
+      expect(mockClearChat).toHaveBeenCalledTimes(1);
+      expect((mockState.chatSessions as Record<string, unknown>)['/parent']).toBeUndefined();
+      expect((mockState.chatSessions as Record<string, unknown>)['/child']).toBeUndefined();
+      expect((mockState.sessionStreams as Record<string, unknown>)['/child']).toBeUndefined();
+      expect((mockState.streamingSessions as string[])).toEqual([]);
+      expect(mockState.currentSessionPath).toBe('/other');
+    });
   });
 
   describe('pinSession', () => {

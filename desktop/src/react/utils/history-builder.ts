@@ -22,6 +22,7 @@ export interface HistoryApiResponse {
     thinking?: string;
     toolCalls?: Array<{ name: string; args?: Record<string, unknown> }>;
     images?: Array<{ data: string; mimeType: string }>;
+    source?: string | null;
     timestamp?: number | string | null;
   }>;
   blocks?: Array<any>;
@@ -193,6 +194,7 @@ export function buildItemsFromHistory(data: HistoryApiResponse): ChatListItem[] 
         id,
         sourceEntryId: m.entryId,
         role: 'user',
+        source: m.source || undefined,
         text,
         textHtml: text ? renderMarkdown(text) : undefined,
         attachments: allAtts.length ? allAtts : undefined,

@@ -570,6 +570,7 @@ export class HanaEngine {
   async setSessionPinned(p, pinned) { return this._sessionCoord.setSessionPinned(p, pinned); }
   async touchSubagentSession(p) { return this._sessionCoord.touchSubagentSession(p); }
   async deleteSubagentSession(p, opts) { return this._sessionCoord.deleteSubagentSession(p, opts); }
+  async deleteSubagentChildrenForParentSession(p, opts) { return this._sessionCoord.deleteSubagentChildrenForParentSession(p, opts); }
   createSessionContext() { return this._sessionCoord.createSessionContext(); }
   promoteActivitySession(f, agentId) { return this._sessionCoord.promoteActivitySession(f, agentId); }
   async executeIsolated(prompt, opts) { return this._sessionCoord.executeIsolated(prompt, opts); }

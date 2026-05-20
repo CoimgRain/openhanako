@@ -182,7 +182,10 @@ function InputAreaInner({ surface }: Required<InputAreaProps>) {
   const pendingNewSession = useStore(s => s.pendingNewSession);
   const pendingSessionSwitchPath = useStore(s => s.pendingSessionSwitchPath);
   const currentSessionPath = useStore(s => s.currentSessionPath);
-  const currentSessionReadOnly = useStore(s => !!(s.currentSessionPath && s.sessions.find(session => session.path === s.currentSessionPath)?.readOnly));
+  const currentSessionInfo = useStore(s => s.currentSessionPath ? s.sessions.find(session => session.path === s.currentSessionPath) : null);
+  const currentSessionReadOnly = currentSessionInfo?.readOnly === true;
+  const currentSessionIsSubagent = currentSessionInfo?.kind === 'subagent' || currentSessionInfo?.collaborationKind === 'subagent';
+  const currentSessionInputLocked = currentSessionReadOnly && !currentSessionIsSubagent;
   const compacting = useStore(s => currentSessionPath ? s.compactingSessions.includes(currentSessionPath) : false);
   const screenshotBusy = useStore(s => s.screenshotTaskCount > 0);
   const screenshotProgress = useStore(s => s.screenshotProgress);
@@ -698,7 +701,7 @@ function InputAreaInner({ surface }: Required<InputAreaProps>) {
   const hasContent = inputText.trim().length > 0 || attachedFiles.length > 0 || docContextAttached || !!quotedSelection
     || editorHasInlineNode(editor, 'skillBadge')
     || editorHasInlineNode(editor, 'fileBadge');
-  const canSend = hasContent && connected && !isStreaming && !modelSwitching && !pendingSessionSwitchPath && !currentSessionReadOnly;
+  const canSend = hasContent && connected && !isStreaming && !modelSwitching && !pendingSessionSwitchPath && !currentSessionInputLocked;
 
   const loadVisionAuxiliaryConfig = useCallback(async () => {
     const res = await hanaFetch('/api/preferences/models');
@@ -827,7 +830,7 @@ function InputAreaInner({ surface }: Required<InputAreaProps>) {
 
   // ── Send message ──
   const handleSend = useCallback(async () => {
-    if (currentSessionReadOnly) return;
+    if (currentSessionInputLocked) return;
     if (!editor) return;
     const editorJson = editor.getJSON();
     const { text: rawText, skills, fileRefs } = serializeEditor(editorJson);
@@ -1007,7 +1010,7 @@ function InputAreaInner({ surface }: Required<InputAreaProps>) {
     } finally {
       setSending(false);
     }
-  }, [editor, currentSessionReadOnly, attachedFiles, docContextAttached, connected, isStreaming, sending, pendingNewSession, currentDoc, clearAttachedFiles, clearDraft, currentSessionPath, setDocContextAttached, slashCommands, slashSelected, handleSlashSelect, supportsVision, currentModelInfo, loadVisionAuxiliaryConfig, modelSwitching, t]);
+  }, [editor, currentSessionInputLocked, attachedFiles, docContextAttached, connected, isStreaming, sending, pendingNewSession, currentDoc, clearAttachedFiles, clearDraft, currentSessionPath, setDocContextAttached, slashCommands, slashSelected, handleSlashSelect, supportsVision, currentModelInfo, loadVisionAuxiliaryConfig, modelSwitching, t]);
 
   // ── Steer ──
   const handleSteer = useCallback(async () => {
@@ -1158,7 +1161,7 @@ function InputAreaInner({ surface }: Required<InputAreaProps>) {
     />
   );
 
-  if (currentSessionReadOnly) {
+  if (currentSessionInputLocked) {
     return (
       <div
         className={`${styles['input-surface']}${surface === 'mobile' ? ` ${styles['input-surface-mobile']}` : ''}`}

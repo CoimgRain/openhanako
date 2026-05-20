@@ -31,6 +31,7 @@ function makeEngine(tmpDir) {
     agentsDir: path.join(tmpDir, "agents"),
     closeSession: vi.fn(async () => {}),
     setSessionPinned: vi.fn(async () => null),
+    deleteSubagentChildrenForParentSession: vi.fn(async () => []),
     agentIdFromSessionPath: (p) => {
       const rel = path.relative(path.join(tmpDir, "agents"), p);
       return rel.split(path.sep)[0] || null;
@@ -92,6 +93,25 @@ describe("archive route: mtime semantics", () => {
     expect(res.status).toBe(200);
     expect(fs.existsSync(sidecar)).toBe(false);
     expect(fs.existsSync(`${dest}.files.json`)).toBe(true);
+  });
+
+  it("deletes subagent child projections when archiving the parent session", async () => {
+    const src = path.join(tmpDir, "agents", "a", "sessions", "s1.jsonl");
+    const child = path.join(tmpDir, "agents", "a", "subagent-sessions", "child.jsonl");
+    engine.deleteSubagentChildrenForParentSession.mockResolvedValueOnce([child]);
+
+    const res = await app.request("/api/sessions/archive", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ path: src }),
+    });
+    const data = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(engine.deleteSubagentChildrenForParentSession).toHaveBeenCalledWith(src, {
+      skipStreamingCheck: true,
+    });
+    expect(data).toEqual({ ok: true, deletedSubagentPaths: [child] });
   });
 
   it("invalidates rc attachment and pending that point at the archived session", async () => {

@@ -101,6 +101,9 @@ function buildOptimisticSubagentSession({
     parentSessionPath,
     taskId,
     taskTitle,
+    subagentStatus: pending ? 'running' : (patch.streamStatus || 'running'),
+    subagentStartedAt: subagentBlock?.subagentStartedAt || subagentBlock?.startedAt || now,
+    subagentCompletedAt: null,
     _optimistic: true,
   };
 }
@@ -142,6 +145,35 @@ function upsertOptimisticSubagentSession(parentSessionPath: string, taskId: stri
       return { sessions: next };
     }
     return { sessions: [optimistic, ...sessions] };
+  });
+}
+
+function patchOptimisticSubagentSessionStatus(taskId: string, patch: Record<string, any>): void {
+  const streamKey = typeof patch.streamKey === 'string' ? patch.streamKey : null;
+  const streamStatus = typeof patch.streamStatus === 'string' ? patch.streamStatus : null;
+  if (!streamKey && !streamStatus) return;
+
+  const nextStatus = streamStatus === 'done' || streamStatus === 'failed' || streamStatus === 'aborted'
+    ? streamStatus
+    : 'running';
+  const terminal = nextStatus === 'done' || nextStatus === 'failed' || nextStatus === 'aborted';
+  const now = new Date().toISOString();
+
+  useStore.setState((prev: any) => {
+    let changed = false;
+    const sessions = (prev.sessions || []).map((session: any) => {
+      const matches = session?.taskId === taskId || (streamKey && session?.path === streamKey);
+      if (!matches) return session;
+      changed = true;
+      return {
+        ...session,
+        ...(streamKey ? { path: streamKey } : {}),
+        pendingSubagent: false,
+        subagentStatus: nextStatus,
+        subagentCompletedAt: terminal ? (session.subagentCompletedAt || now) : null,
+      };
+    });
+    return changed ? { sessions } : {};
   });
 }
 
@@ -532,9 +564,15 @@ export function handleServerMessage(msg: any): void {
       if (!taskId || !patch) break;
       if (!sp) { console.warn('[ws] event missing sessionPath:', msg.type); break; }
       useStore.getState().patchBlockByTaskId(sp, taskId, patch);
+      patchOptimisticSubagentSessionStatus(taskId, patch as Record<string, any>);
       if ((patch as { streamKey?: unknown }).streamKey) {
         upsertOptimisticSubagentSession(sp, taskId, patch as Record<string, any>);
         scheduleSessionsRefresh('subagent-stream-ready');
+      }
+      if ((patch as { streamStatus?: unknown }).streamStatus === 'done'
+        || (patch as { streamStatus?: unknown }).streamStatus === 'failed'
+        || (patch as { streamStatus?: unknown }).streamStatus === 'aborted') {
+        scheduleSessionsRefresh('subagent-settled');
       }
       break;
     }
@@ -586,6 +624,7 @@ export function handleServerMessage(msg: any): void {
         data: {
           id: msg.message.id || `user-${Date.now()}`,
           role: 'user',
+          source: msg.message.source || undefined,
           text,
           textHtml: text ? renderMarkdown(text) : undefined,
           timestamp: normalizeMessageTimestamp(msg.message.timestamp),

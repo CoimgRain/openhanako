@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { Session } from '../../types';
-import { buildSessionSections } from '../../components/session-sections';
+import { buildSessionSections, type SessionSection } from '../../components/session-sections';
 
 function makeSession(overrides: Partial<Session>): Session {
   return {
@@ -14,6 +14,10 @@ function makeSession(overrides: Partial<Session>): Session {
     cwd: null,
     ...overrides,
   };
+}
+
+function itemPaths(section: SessionSection): string[] {
+  return section.items.map(item => item.session.path);
 }
 
 describe('buildSessionSections', () => {
@@ -46,7 +50,7 @@ describe('buildSessionSections', () => {
       kind: 'pinned',
       titleKey: 'sidebar.pinned',
     });
-    expect(sections[0].items.map(item => item.path)).toEqual([
+    expect(itemPaths(sections[0])).toEqual([
       '/sessions/new-pin.jsonl',
       '/sessions/old-pin.jsonl',
     ]);
@@ -54,7 +58,7 @@ describe('buildSessionSections', () => {
       kind: 'date',
       titleKey: 'time.today',
     });
-    expect(sections[1].items.map(item => item.path)).toEqual(['/sessions/today.jsonl']);
+    expect(itemPaths(sections[1])).toEqual(['/sessions/today.jsonl']);
   });
 
   it('keeps the pinned section visible when no sessions are pinned and rolls yesterday into this week', () => {
@@ -104,7 +108,7 @@ describe('buildSessionSections', () => {
 
     const todaySection = sections.find(s => s.kind === 'date' && s.group === 'today');
     expect(todaySection).toBeDefined();
-    expect(todaySection!.items.map(i => i.path)).toEqual([
+    expect(itemPaths(todaySection!)).toEqual([
       '/sessions/newer.jsonl',
       '/sessions/middle.jsonl',
       '/sessions/older.jsonl',
@@ -132,10 +136,79 @@ describe('buildSessionSections', () => {
 
     const todaySection = sections.find(s => s.kind === 'date' && s.group === 'today');
     const earlierSection = sections.find(s => s.kind === 'date' && s.group === 'earlier');
-    expect(todaySection!.items.map(i => i.path)).toEqual([
+    expect(itemPaths(todaySection!)).toEqual([
       '/sessions/a-same-time.jsonl',
       '/sessions/z-same-time.jsonl',
     ]);
-    expect(earlierSection!.items.map(i => i.path)).toEqual(['/sessions/bad-date.jsonl']);
+    expect(itemPaths(earlierSection!)).toEqual(['/sessions/bad-date.jsonl']);
+  });
+
+  it('nests subagent projections under their parent session and sorts children by created time instead of modified time', () => {
+    const sections = buildSessionSections([
+      makeSession({
+        path: '/agents/hana/sessions/parent.jsonl',
+        firstMessage: 'parent',
+        modified: '2026-04-29T03:00:00.000Z',
+      }),
+      makeSession({
+        path: '/agents/hana/subagent-sessions/old-child.jsonl',
+        firstMessage: 'old child',
+        modified: '2026-04-29T10:00:00.000Z',
+        kind: 'subagent',
+        collaborationKind: 'subagent',
+        readOnly: true,
+        parentSessionPath: '/agents/hana/sessions/parent.jsonl',
+        subagentStartedAt: '2026-04-29T08:00:00.000Z',
+      }),
+      makeSession({
+        path: '/agents/hana/subagent-sessions/new-child.jsonl',
+        firstMessage: 'new child',
+        modified: '2026-04-29T09:00:00.000Z',
+        kind: 'subagent',
+        collaborationKind: 'subagent',
+        readOnly: true,
+        parentSessionPath: '/agents/hana/sessions/parent.jsonl',
+        subagentStartedAt: '2026-04-29T08:30:00.000Z',
+      }),
+      makeSession({
+        path: '/agents/hana/sessions/other.jsonl',
+        firstMessage: 'other',
+        modified: '2026-04-29T07:00:00.000Z',
+      }),
+    ], {
+      mode: 'time',
+      now: new Date('2026-04-29T12:00:00.000Z'),
+    });
+
+    const todaySection = sections.find(s => s.kind === 'date' && s.group === 'today');
+    expect(itemPaths(todaySection!)).toEqual([
+      '/agents/hana/sessions/other.jsonl',
+      '/agents/hana/sessions/parent.jsonl',
+    ]);
+    const parent = todaySection!.items.find(item => item.session.path === '/agents/hana/sessions/parent.jsonl');
+    expect(parent!.children.map(child => child.path)).toEqual([
+      '/agents/hana/subagent-sessions/new-child.jsonl',
+      '/agents/hana/subagent-sessions/old-child.jsonl',
+    ]);
+  });
+
+  it('keeps orphan subagent projections visible as top-level fallback rows', () => {
+    const sections = buildSessionSections([
+      makeSession({
+        path: '/agents/hana/subagent-sessions/orphan.jsonl',
+        modified: '2026-04-29T09:00:00.000Z',
+        kind: 'subagent',
+        collaborationKind: 'subagent',
+        readOnly: true,
+        parentSessionPath: '/agents/hana/sessions/missing.jsonl',
+      }),
+    ], {
+      mode: 'time',
+      now: new Date('2026-04-29T12:00:00.000Z'),
+    });
+
+    const todaySection = sections.find(s => s.kind === 'date' && s.group === 'today');
+    expect(itemPaths(todaySection!)).toEqual(['/agents/hana/subagent-sessions/orphan.jsonl']);
+    expect(todaySection!.items[0].children).toEqual([]);
   });
 });

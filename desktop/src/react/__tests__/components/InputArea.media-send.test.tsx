@@ -128,6 +128,7 @@ function seedSession() {
     currentSessionPath: '/session/media.jsonl',
     connected: true,
     pendingNewSession: false,
+    pendingSessionSwitchPath: null,
     streamingSessions: [],
     inlineErrors: {},
     attachedFiles: [{
@@ -217,6 +218,34 @@ describe('InputArea media send', () => {
 
     await waitFor(() => {
       expect(mocks.wsSend).not.toHaveBeenCalled();
+    });
+  });
+
+  it('allows sending from a read-only subagent collaboration session', async () => {
+    useStore.setState({
+      sessions: [{
+        path: '/session/media.jsonl',
+        title: 'A ↔ B',
+        firstMessage: 'task',
+        modified: new Date().toISOString(),
+        messageCount: 1,
+        agentId: 'agent-b',
+        agentName: 'Agent B',
+        cwd: null,
+        kind: 'subagent',
+        collaborationKind: 'subagent',
+        readOnly: true,
+      }],
+    } as never);
+
+    render(React.createElement(InputArea));
+
+    const send = screen.getByTestId('send') as HTMLButtonElement;
+    expect(send.disabled).toBe(false);
+    fireEvent.click(send);
+
+    await waitFor(() => {
+      expect(mocks.wsSend).toHaveBeenCalledTimes(1);
     });
   });
 });

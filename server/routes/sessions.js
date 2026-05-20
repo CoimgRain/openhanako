@@ -81,6 +81,23 @@ function authorizeSessionRoute(requestContext, capability, target) {
 
 const TODO_COMPLETE_MESSAGE =
   "[Hana Todo] The user marked the current todo list as completed and removed it from the session UI. Treat every item in that list as completed. Create a new todo list only if new work needs tracking.";
+const SUBAGENT_HUMAN_MESSAGE_START = "<hana-subagent-human-message>";
+const SUBAGENT_HUMAN_MESSAGE_END = "</hana-subagent-human-message>";
+
+function normalizeDisplayedUserText(text) {
+  const source = typeof text === "string" ? text : "";
+  const start = source.indexOf(SUBAGENT_HUMAN_MESSAGE_START);
+  const end = source.indexOf(SUBAGENT_HUMAN_MESSAGE_END);
+  if (start < 0 || end < 0 || end < start) {
+    return { text: source, source: null };
+  }
+  return {
+    text: source
+      .slice(start + SUBAGENT_HUMAN_MESSAGE_START.length, end)
+      .trim(),
+    source: "desktop",
+  };
+}
 
 export function createSessionsRoute(engine, hub = null) {
   const route = new Hono();
@@ -294,6 +311,9 @@ export function createSessionsRoute(engine, hub = null) {
           parentSessionPath: s.parentSessionPath || null,
           taskId: s.taskId || null,
           taskTitle: s.taskTitle || null,
+          subagentStatus: s.subagentStatus || null,
+          subagentStartedAt: s.subagentStartedAt || null,
+          subagentCompletedAt: s.subagentCompletedAt || null,
           rcAttachment: rcAttachmentByPath.get(s.path)
             ? {
               ...rcAttachmentByPath.get(s.path),
@@ -389,13 +409,15 @@ export function createSessionsRoute(engine, hub = null) {
       for (const m of sourceMessages) {
         if (m.role === "user") {
           const { text, images } = extractTextContent(m.content);
-          if (text || images.length) {
+          const displayed = normalizeDisplayedUserText(text);
+          if (displayed.text || images.length) {
             allMessages.push({
               id: String(globalIdx),
               ...(m.id ? { entryId: m.id } : {}),
               role: "user",
-              content: text,
+              content: displayed.text,
               images: images.length ? images : undefined,
+              ...((m.source || displayed.source) ? { source: m.source || displayed.source } : {}),
               ...(m.timestamp ? { timestamp: m.timestamp } : {}),
             });
             globalIdx++;
@@ -796,7 +818,7 @@ export function createSessionsRoute(engine, hub = null) {
     return c.json({ ok: true, sessions: bm.getBrowserSessionStates() });
   });
 
-  // 点开只读 subagent 内部对话时重置 10 分钟自动删除计时
+  // 点开或正在查看只读 subagent 内部对话时重置 10 分钟自动删除计时
   route.post("/sessions/subagent/touch", async (c) => {
     try {
       const requestContext = createRequestContext(c, engine);
@@ -949,6 +971,9 @@ export function createSessionsRoute(engine, hub = null) {
       // 先从 engine 的 session map 中移除（如果正在后台跑会被 abort）
       await engine.setSessionPinned(sessionPath, false);
       await engine.closeSession(sessionPath);
+      const deletedSubagentPaths = await engine.deleteSubagentChildrenForParentSession?.(sessionPath, {
+        skipStreamingCheck: true,
+      }) || [];
 
       // 从 session 路径推导归档目录（同 agent 的 sessions/archived/）
       const sessDir = path.dirname(sessionPath);
@@ -969,7 +994,10 @@ export function createSessionsRoute(engine, hub = null) {
 
       invalidateRcTarget(sessionPath);
 
-      return c.json({ ok: true });
+      return c.json({
+        ok: true,
+        ...(deletedSubagentPaths.length > 0 ? { deletedSubagentPaths } : {}),
+      });
     } catch (err) {
       return c.json({ error: err.message }, 500);
     }

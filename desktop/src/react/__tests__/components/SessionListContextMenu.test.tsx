@@ -1,7 +1,7 @@
 /**
  * @vitest-environment jsdom
  */
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import '@testing-library/jest-dom/vitest';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
@@ -12,6 +12,7 @@ const switchSessionMock = vi.fn();
 const archiveSessionMock = vi.fn();
 const renameSessionMock = vi.fn();
 const pinSessionMock = vi.fn();
+const loadSessionsMock = vi.fn();
 
 vi.mock('../../hooks/use-hana-fetch', () => ({
   hanaFetch: (...args: unknown[]) => hanaFetchMock(...args),
@@ -23,6 +24,7 @@ vi.mock('../../stores/session-actions', () => ({
   archiveSession: (...args: unknown[]) => archiveSessionMock(...args),
   renameSession: (...args: unknown[]) => renameSessionMock(...args),
   pinSession: (...args: unknown[]) => pinSessionMock(...args),
+  loadSessions: (...args: unknown[]) => loadSessionsMock(...args),
 }));
 
 vi.mock('../../hooks/use-i18n', () => ({
@@ -93,6 +95,7 @@ describe('SessionList context menu', () => {
     hanaFetchMock.mockImplementation(async (url: string) => {
       if (url === '/api/browser/session-states') return jsonResponse({});
       if (url === '/api/browser/sessions') return jsonResponse({});
+      if (url === '/api/sessions/subagent/touch') return jsonResponse({ modified: '2026-04-29T08:10:00.000Z' });
       if (url.startsWith('/api/sessions/summary')) {
         return jsonResponse({
           hasSummary: true,
@@ -107,6 +110,7 @@ describe('SessionList context menu', () => {
     archiveSessionMock.mockReset();
     renameSessionMock.mockReset();
     pinSessionMock.mockReset();
+    loadSessionsMock.mockReset();
     seedSessions();
   });
 
@@ -242,6 +246,451 @@ describe('SessionList context menu', () => {
 
     expect(css).toMatch(/\.sessionItemActive \.sessionPinBtn,\s*\.sessionItemActive \.sessionRenameBtn,\s*\.sessionItemActive \.sessionArchiveBtn/);
     expect(css).toMatch(/\.sessionItem:focus-visible \.sessionPinBtn,\s*\.sessionItem:focus-visible \.sessionRenameBtn,\s*\.sessionItem:focus-visible \.sessionArchiveBtn/);
-    expect(css).toMatch(/\.sessionItemActive \.sessionItemMeta,\s*\.sessionItem:focus-visible \.sessionItemMeta/);
+    expect(css).toMatch(/\.sessionItemActive(?::not\([^)]*\))? \.sessionItemMeta,\s*\.sessionItem:focus-visible \.sessionItemMeta/);
+  });
+
+  it('pauses the subagent countdown and keeps touching it while the current chat is focused', async () => {
+    const hasFocusSpy = vi.spyOn(document, 'hasFocus').mockReturnValue(true);
+    Object.defineProperty(document, 'visibilityState', { value: 'visible', configurable: true });
+    try {
+      useStore.setState({
+        sessions: [
+          {
+            path: '/tmp/agents/hana/subagent-sessions/child.jsonl',
+            title: '内部对话',
+            firstMessage: '执行阶段一',
+            modified: new Date(Date.now() - 9 * 60 * 1000).toISOString(),
+            messageCount: 2,
+            agentId: 'agent-b',
+            agentName: '小库',
+            executorAgentId: 'agent-b',
+            executorAgentName: '小库',
+            requesterAgentId: 'hana',
+            requesterAgentName: '小颜',
+            cwd: '/tmp/project',
+            pinnedAt: null,
+            readOnly: true,
+            kind: 'subagent',
+            collaborationKind: 'subagent',
+            taskTitle: '执行阶段一',
+          },
+        ],
+        currentSessionPath: '/tmp/agents/hana/subagent-sessions/child.jsonl',
+        pendingSessionSwitchPath: null,
+        pendingNewSession: false,
+        agents: [],
+        streamingSessions: [],
+        browserBySession: {},
+        locale: 'zh',
+      });
+
+      render(<SessionList />);
+      window.dispatchEvent(new Event('focus'));
+
+      expect(await screen.findByTitle('正在查看，自动删除计时已暂停')).toBeTruthy();
+      await waitFor(() => expect(hanaFetchMock).toHaveBeenCalledWith('/api/sessions/subagent/touch', expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({ path: '/tmp/agents/hana/subagent-sessions/child.jsonl' }),
+      })));
+      expect(loadSessionsMock).not.toHaveBeenCalled();
+    } finally {
+      hasFocusSpy.mockRestore();
+    }
+  });
+
+  it('keeps running subagent sessions spinning instead of showing the completion countdown', async () => {
+    useStore.setState({
+      sessions: [
+        {
+          path: '/tmp/agents/hana/subagent-sessions/running-child.jsonl',
+          title: '内部对话',
+          firstMessage: '执行中的任务',
+          modified: new Date(Date.now() - 9 * 60 * 1000).toISOString(),
+          messageCount: 1,
+          agentId: 'agent-b',
+          agentName: '小库',
+          executorAgentId: 'agent-b',
+          executorAgentName: '小库',
+          requesterAgentId: 'hana',
+          requesterAgentName: '小颜',
+          cwd: '/tmp/project',
+          pinnedAt: null,
+          readOnly: true,
+          kind: 'subagent',
+          collaborationKind: 'subagent',
+          taskTitle: '执行中的任务',
+          subagentStatus: 'running',
+          subagentStartedAt: new Date(Date.now() - 90_000).toISOString(),
+        },
+      ],
+      currentSessionPath: null,
+      pendingSessionSwitchPath: null,
+      pendingNewSession: false,
+      agents: [],
+      streamingSessions: [],
+      browserBySession: {},
+      locale: 'zh',
+    });
+
+    render(<SessionList />);
+
+    expect(screen.getByLabelText('执行中，等待任务完成')).toBeInTheDocument();
+    expect(screen.getByTitle('小颜 → 小库')).toBeInTheDocument();
+    expect(screen.getByText('执行中')).toBeInTheDocument();
+    expect(screen.queryByTitle(/分钟后自动删除/)).not.toBeInTheDocument();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(loadSessionsMock).not.toHaveBeenCalled();
+  });
+
+  it('treats subagent sessions with taskId but no terminal status as still running', () => {
+    useStore.setState({
+      sessions: [
+        {
+          path: '/tmp/agents/hana/subagent-sessions/unknown-child.jsonl',
+          title: '内部对话',
+          firstMessage: '仍在思考的任务',
+          modified: new Date(Date.now() - 9 * 60 * 1000).toISOString(),
+          messageCount: 1,
+          agentId: 'agent-b',
+          agentName: '小库',
+          executorAgentId: 'agent-b',
+          executorAgentName: '小库',
+          requesterAgentId: 'hana',
+          requesterAgentName: '小颜',
+          cwd: '/tmp/project',
+          pinnedAt: null,
+          readOnly: true,
+          kind: 'subagent',
+          collaborationKind: 'subagent',
+          taskId: 'subagent-unknown',
+          taskTitle: '仍在思考的任务',
+        },
+      ],
+      currentSessionPath: null,
+      pendingSessionSwitchPath: null,
+      pendingNewSession: false,
+      agents: [],
+      streamingSessions: [],
+      browserBySession: {},
+      locale: 'zh',
+    });
+
+    render(<SessionList />);
+
+    expect(screen.getByLabelText('执行中，等待任务完成')).toBeInTheDocument();
+    expect(screen.queryByTitle(/分钟后自动删除/)).not.toBeInTheDocument();
+  });
+
+  it('keeps explicitly running subagent sessions spinning even after assistant output', () => {
+    useStore.setState({
+      sessions: [
+        {
+          path: '/tmp/agents/hana/subagent-sessions/running-with-output-child.jsonl',
+          title: '内部对话',
+          firstMessage: '仍在整理的任务',
+          modified: new Date().toISOString(),
+          messageCount: 2,
+          agentId: 'agent-b',
+          agentName: '小库',
+          executorAgentId: 'agent-b',
+          executorAgentName: '小库',
+          requesterAgentId: 'hana',
+          requesterAgentName: '小颜',
+          cwd: '/tmp/project',
+          pinnedAt: null,
+          readOnly: true,
+          kind: 'subagent',
+          collaborationKind: 'subagent',
+          taskId: 'subagent-running-with-output',
+          taskTitle: '仍在整理的任务',
+          subagentStatus: 'running',
+        },
+      ],
+      currentSessionPath: null,
+      pendingSessionSwitchPath: null,
+      pendingNewSession: false,
+      agents: [],
+      streamingSessions: [],
+      browserBySession: {},
+      locale: 'zh',
+    });
+
+    render(<SessionList />);
+
+    expect(screen.getByLabelText('执行中，等待任务完成')).toBeInTheDocument();
+    expect(screen.queryByTitle(/分钟后自动删除/)).not.toBeInTheDocument();
+  });
+
+  it('shows parent session normal timestamp while a child subagent is running', () => {
+    const parentModified = new Date(Date.now() - 9 * 60 * 1000).toISOString();
+    useStore.setState({
+      sessions: [
+        {
+          path: '/tmp/agents/hana/sessions/parent.jsonl',
+          title: '你看一下，我数据库有什么',
+          firstMessage: '你看一下，我数据库有什么',
+          modified: parentModified,
+          messageCount: 2,
+          agentId: 'hana',
+          agentName: '小颜',
+          cwd: '/tmp/project',
+          pinnedAt: null,
+        },
+        {
+          path: '/tmp/agents/hana/subagent-sessions/running-child.jsonl',
+          title: '内部对话',
+          firstMessage: '再次巡检 KK 知识库',
+          modified: new Date().toISOString(),
+          messageCount: 1,
+          agentId: 'agent-b',
+          agentName: '小库',
+          executorAgentId: 'agent-b',
+          executorAgentName: '小库',
+          requesterAgentId: 'hana',
+          requesterAgentName: '小颜',
+          parentSessionPath: '/tmp/agents/hana/sessions/parent.jsonl',
+          cwd: '/tmp/project',
+          pinnedAt: null,
+          readOnly: true,
+          kind: 'subagent',
+          collaborationKind: 'subagent',
+          taskTitle: '再次巡检 KK 知识库',
+          subagentStatus: 'running',
+          subagentStartedAt: new Date(Date.now() - 90_000).toISOString(),
+        },
+      ],
+      currentSessionPath: null,
+      pendingSessionSwitchPath: null,
+      pendingNewSession: false,
+      agents: [],
+      streamingSessions: [],
+      browserBySession: {},
+      locale: 'zh',
+    });
+
+    render(<SessionList />);
+
+    const parent = sessionButton('你看一下，我数据库有什么');
+    expect(parent).not.toHaveTextContent('执行中');
+    expect(parent).toHaveTextContent('小颜');
+    expect(parent).toHaveTextContent('time.minutesAgo');
+    expect(sessionButton('再次巡检 KK 知识库')).toHaveTextContent('执行中');
+  });
+
+  it('switches a completed subagent from running to countdown/check state', () => {
+    useStore.setState({
+      sessions: [
+        {
+          path: '/tmp/agents/hana/subagent-sessions/done-child.jsonl',
+          title: '内部对话',
+          firstMessage: '已经完成的任务',
+          modified: new Date().toISOString(),
+          messageCount: 2,
+          agentId: 'agent-b',
+          agentName: '小库',
+          executorAgentId: 'agent-b',
+          executorAgentName: '小库',
+          requesterAgentId: 'hana',
+          requesterAgentName: '小颜',
+          cwd: '/tmp/project',
+          pinnedAt: null,
+          readOnly: true,
+          kind: 'subagent',
+          collaborationKind: 'subagent',
+          taskId: 'subagent-done',
+          taskTitle: '已经完成的任务',
+          subagentCompletedAt: new Date().toISOString(),
+        },
+      ],
+      currentSessionPath: null,
+      pendingSessionSwitchPath: null,
+      pendingNewSession: false,
+      agents: [],
+      streamingSessions: [],
+      browserBySession: {},
+      locale: 'zh',
+    });
+
+    render(<SessionList />);
+
+    expect(screen.queryByLabelText('执行中，等待任务完成')).not.toBeInTheDocument();
+    expect(screen.getByTitle(/分钟后自动删除/)).toBeInTheDocument();
+  });
+
+  it('does not keep the old flashing dot beside running subagent avatars', () => {
+    const css = fs.readFileSync(
+      path.join(__dirname, '../../components/SessionList.module.css'),
+      'utf-8',
+    );
+
+    expect(css).not.toContain('sessionAgentPairRunning');
+  });
+
+  it('uses the same ring-to-check interaction for main agent sessions without auto-delete countdown', async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-05-21T04:50:00.000Z'));
+      const mainPath = '/tmp/agents/hana/sessions/main.jsonl';
+      useStore.setState({
+        sessions: [
+          {
+            path: mainPath,
+            title: '再次巡检 KK 知识库',
+            firstMessage: '再次巡检 KK 知识库',
+            modified: new Date().toISOString(),
+            messageCount: 2,
+            agentId: 'hana',
+            agentName: '小库',
+            cwd: '/tmp/project',
+            pinnedAt: null,
+          },
+        ],
+        currentSessionPath: mainPath,
+        pendingSessionSwitchPath: null,
+        pendingNewSession: false,
+        agents: [],
+        streamingSessions: [mainPath],
+        browserBySession: {},
+        locale: 'zh',
+      });
+
+      render(<SessionList />);
+
+      expect(screen.getByLabelText('执行中，等待任务完成')).toBeInTheDocument();
+      expect(screen.queryByTitle(/分钟后自动删除/)).not.toBeInTheDocument();
+      expect(sessionButton('再次巡检 KK 知识库')).toHaveTextContent('执行中');
+      expect(sessionButton('再次巡检 KK 知识库')).toHaveTextContent('00:00');
+
+      act(() => {
+        vi.advanceTimersByTime(2100);
+      });
+      expect(sessionButton('再次巡检 KK 知识库')).toHaveTextContent('00:02');
+
+      act(() => {
+        useStore.setState({ streamingSessions: [] } as never);
+      });
+
+      expect(screen.getByLabelText('任务已完成，点击收起')).toBeInTheDocument();
+      expect(screen.queryByTitle(/分钟后自动删除/)).not.toBeInTheDocument();
+      expect(sessionButton('再次巡检 KK 知识库')).toHaveTextContent('耗时');
+      expect(sessionButton('再次巡检 KK 知识库')).toHaveTextContent('00:02');
+
+      act(() => {
+        vi.advanceTimersByTime(2999);
+      });
+      expect(screen.getByLabelText('任务已完成，点击收起')).toBeInTheDocument();
+      expect(sessionButton('再次巡检 KK 知识库')).toHaveTextContent('耗时');
+      expect(sessionButton('再次巡检 KK 知识库')).toHaveTextContent('00:02');
+
+      act(() => {
+        vi.advanceTimersByTime(1);
+      });
+      expect(screen.getByLabelText('任务已完成，点击收起').className).toMatch(/sessionCountdownDismissing/);
+
+      act(() => {
+        vi.advanceTimersByTime(560);
+      });
+      expect(screen.queryByLabelText('任务已完成，点击收起')).not.toBeInTheDocument();
+      expect(sessionButton('再次巡检 KK 知识库')).toHaveTextContent('耗时');
+      expect(sessionButton('再次巡检 KK 知识库')).toHaveTextContent('00:02');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('resets the main agent duration when a new run starts', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-05-21T04:55:00.000Z'));
+      const mainPath = '/tmp/agents/hana/sessions/main.jsonl';
+      useStore.setState({
+        sessions: [
+          {
+            path: mainPath,
+            title: '持续优化主任务',
+            firstMessage: '持续优化主任务',
+            modified: new Date().toISOString(),
+            messageCount: 2,
+            agentId: 'hana',
+            agentName: '小库',
+            cwd: '/tmp/project',
+            pinnedAt: null,
+          },
+        ],
+        currentSessionPath: mainPath,
+        pendingSessionSwitchPath: null,
+        pendingNewSession: false,
+        agents: [],
+        streamingSessions: [mainPath],
+        browserBySession: {},
+        locale: 'zh',
+      });
+
+      render(<SessionList />);
+
+      act(() => {
+        vi.advanceTimersByTime(3200);
+        useStore.setState({ streamingSessions: [] } as never);
+      });
+      expect(sessionButton('持续优化主任务')).toHaveTextContent('耗时');
+      expect(sessionButton('持续优化主任务')).toHaveTextContent('00:03');
+
+      act(() => {
+        vi.advanceTimersByTime(5000);
+        useStore.setState({ streamingSessions: [mainPath] } as never);
+      });
+
+      expect(sessionButton('持续优化主任务')).toHaveTextContent('执行中');
+      expect(sessionButton('持续优化主任务')).toHaveTextContent('00:00');
+      expect(sessionButton('持续优化主任务')).not.toHaveTextContent('耗时');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('lets users dismiss the main agent completion check before the 3 second auto-hide', async () => {
+    vi.useFakeTimers();
+    try {
+      const mainPath = '/tmp/agents/hana/sessions/main.jsonl';
+      useStore.setState({
+        sessions: [
+          {
+            path: mainPath,
+            title: '再次巡检 KK 知识库',
+            firstMessage: '再次巡检 KK 知识库',
+            modified: new Date().toISOString(),
+            messageCount: 2,
+            agentId: 'hana',
+            agentName: '小库',
+            cwd: '/tmp/project',
+            pinnedAt: null,
+          },
+        ],
+        currentSessionPath: mainPath,
+        pendingSessionSwitchPath: null,
+        pendingNewSession: false,
+        agents: [],
+        streamingSessions: [mainPath],
+        browserBySession: {},
+        locale: 'zh',
+      });
+
+      render(<SessionList />);
+
+      act(() => {
+        useStore.setState({ streamingSessions: [] } as never);
+      });
+
+      fireEvent.click(sessionButton('再次巡检 KK 知识库'));
+      expect(screen.getByLabelText('任务已完成，点击收起').className).toMatch(/sessionCountdownDismissing/);
+
+      act(() => {
+        vi.advanceTimersByTime(560);
+      });
+
+      expect(screen.queryByLabelText('任务已完成，点击收起')).not.toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

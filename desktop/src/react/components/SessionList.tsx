@@ -5,13 +5,13 @@
  * 通过 portal 渲染到 #sessionList，从 Zustand sessions 状态驱动。
  */
 
-import { Fragment, memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Fragment, memo, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { useStore } from '../stores';
 import { hanaFetch } from '../hooks/use-hana-fetch';
 import { useI18n } from '../hooks/use-i18n';
 import { formatSessionDate } from '../utils/format';
-import { switchSession, archiveSession, renameSession, pinSession, deleteSubagentSession, loadSessions } from '../stores/session-actions';
+import { switchSession, archiveSession, renameSession, pinSession, loadSessions } from '../stores/session-actions';
 import { updateKeyed } from '../stores/create-keyed-slice';
 import type { Session, Agent } from '../types';
 import { AgentAvatar, resolveAgentDisplayInfo } from '../utils/agent-display';
@@ -22,6 +22,70 @@ import styles from './SessionList.module.css';
 
 
 const SUBAGENT_SESSION_TTL_MS = 10 * 60 * 1000;
+const SUBAGENT_SESSION_TOUCH_INTERVAL_MS = 30 * 1000;
+const MAIN_COMPLETION_HOLD_MS = 3000;
+const MAIN_COMPLETION_DISMISS_MS = 560;
+type SubagentStatus = 'running' | 'done' | 'failed' | 'aborted';
+const SUBAGENT_STATUS_SET = new Set<SubagentStatus>(['running', 'done', 'failed', 'aborted']);
+type MainSessionCompletionState = 'done' | 'dismissing';
+type MainSessionTiming = {
+  startedAt: string;
+  completedAt: string | null;
+};
+
+function isReadOnlySubagentSession(session: Session | null | undefined) {
+  return !!session
+    && (session.collaborationKind === 'subagent' || session.kind === 'subagent')
+    && session.readOnly === true;
+}
+
+function normalizeSubagentStatus(status: Session['subagentStatus']): SubagentStatus | null {
+  return typeof status === 'string' && SUBAGENT_STATUS_SET.has(status as SubagentStatus)
+    ? status as SubagentStatus
+    : null;
+}
+
+function stripTaskTitlePrefix(title: string): string {
+  return title.replace(/^任务[:：]\s*/, '');
+}
+
+function deriveSubagentStatus(session: Session | null | undefined, isStreaming = false): SubagentStatus {
+  if (!session) return 'done';
+  if (isStreaming || session.pendingSubagent) return 'running';
+  const normalized = normalizeSubagentStatus(session.subagentStatus);
+  if (normalized === 'running') return 'running';
+  if (session.subagentCompletedAt) return 'done';
+  if (normalized) return normalized;
+  // 有 taskId 但还没有终态状态时，优先当作仍在运行，避免模型思考中提前显示完成。
+  if (session.taskId && !session.subagentCompletedAt) return 'running';
+  const hasAssistantOutput = (session.messageCount || 0) > 1;
+  if (hasAssistantOutput) return 'done';
+  return 'done';
+}
+
+function parseIsoTime(value: string | null | undefined): number | null {
+  if (!value) return null;
+  const time = Date.parse(value);
+  return Number.isFinite(time) ? time : null;
+}
+
+function formatTaskDurationLabel(startedAt: string | null | undefined, completedAt: string | null | undefined, now: number): string | null {
+  const startMs = parseIsoTime(startedAt);
+  if (startMs === null) return null;
+  const endMs = parseIsoTime(completedAt) ?? now;
+  const totalSeconds = Math.max(0, Math.floor((endMs - startMs) / 1000));
+  const minutes = Math.min(99, Math.floor(totalSeconds / 60));
+  const seconds = totalSeconds % 60;
+  return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+}
+
+function subagentTaskStartFromId(taskId: string | null | undefined): string | null {
+  if (!taskId) return null;
+  const match = /^subagent-(\d+)-/.exec(taskId);
+  if (!match) return null;
+  const ms = Number(match[1]);
+  return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
+}
 
 interface BrowserSessionState {
   url: string | null;
@@ -76,7 +140,14 @@ function SessionListInner() {
 
   const [browserSessions, setBrowserSessions] = useState<Record<string, BrowserSessionState>>({});
   const [countdownNow, setCountdownNow] = useState(() => Date.now());
+  const [windowAttentionActive, setWindowAttentionActive] = useState(() => (
+    document.visibilityState !== 'hidden' && document.hasFocus()
+  ));
+  const [mainCompletionByPath, setMainCompletionByPath] = useState<Record<string, MainSessionCompletionState>>({});
+  const [mainTimingByPath, setMainTimingByPath] = useState<Record<string, MainSessionTiming>>({});
   const closingBrowserSessionsRef = useRef(new Set<string>());
+  const previousStreamingPathsRef = useRef<Set<string> | null>(null);
+  const mainCompletionDismissTimersRef = useRef(new Map<string, number>());
 
   const setVisibleBrowserSessions = useCallback((data: unknown) => {
     const states = normalizeBrowserSessionStates(data);
@@ -86,23 +157,194 @@ function SessionListInner() {
     setBrowserSessions(states);
   }, []);
 
-  const hasSubagentCountdown = sessions.some(s => (s.collaborationKind === 'subagent' || s.kind === 'subagent') && s.readOnly);
+  const hasSubagentCountdown = sessions.some(isReadOnlySubagentSession);
+  const hasLiveSessionTimer = hasSubagentCountdown || streamingSessions.length > 0;
   useEffect(() => {
-    if (!hasSubagentCountdown) return;
+    if (!hasLiveSessionTimer) return;
     const timer = window.setInterval(() => setCountdownNow(Date.now()), 1000);
     return () => window.clearInterval(timer);
-  }, [hasSubagentCountdown]);
+  }, [hasLiveSessionTimer]);
+
+  useEffect(() => {
+    const currentStreamingPaths = new Set(streamingSessions);
+    const previousStreamingPaths = previousStreamingPathsRef.current;
+    previousStreamingPathsRef.current = currentStreamingPaths;
+
+    setMainTimingByPath(prev => {
+      let next: Record<string, MainSessionTiming> | null = null;
+      const ensureNext = () => {
+        if (!next) next = { ...prev };
+        return next;
+      };
+      const nowIso = new Date().toISOString();
+      const sessionPathSet = new Set(sessions.map(session => session.path));
+
+      for (const sessionPath of Object.keys(prev)) {
+        if (!sessionPathSet.has(sessionPath)) {
+          delete ensureNext()[sessionPath];
+        }
+      }
+
+      for (const sessionPath of currentStreamingPaths) {
+        const session = sessions.find(item => item.path === sessionPath);
+        if (!session || isReadOnlySubagentSession(session)) continue;
+        const current = prev[sessionPath];
+        if (!current || current.completedAt) {
+          ensureNext()[sessionPath] = { startedAt: nowIso, completedAt: null };
+        }
+      }
+
+      if (previousStreamingPaths) {
+        for (const sessionPath of previousStreamingPaths) {
+          if (currentStreamingPaths.has(sessionPath)) continue;
+          const session = sessions.find(item => item.path === sessionPath);
+          if (!session || isReadOnlySubagentSession(session)) continue;
+          const current = (next || prev)[sessionPath];
+          if (current && !current.completedAt) {
+            ensureNext()[sessionPath] = { ...current, completedAt: nowIso };
+          }
+        }
+      }
+
+      return next || prev;
+    });
+
+    setMainCompletionByPath(prev => {
+      let next: Record<string, MainSessionCompletionState> | null = null;
+      const ensureNext = () => {
+        if (!next) next = { ...prev };
+        return next;
+      };
+
+      for (const sessionPath of currentStreamingPaths) {
+        if (prev[sessionPath]) {
+          delete ensureNext()[sessionPath];
+        }
+      }
+
+      if (previousStreamingPaths) {
+        for (const sessionPath of previousStreamingPaths) {
+          if (currentStreamingPaths.has(sessionPath)) continue;
+          const session = sessions.find(item => item.path === sessionPath);
+          if (!session || isReadOnlySubagentSession(session)) continue;
+          ensureNext()[sessionPath] = 'done';
+        }
+      }
+
+      return next || prev;
+    });
+  }, [sessions, streamingSessions]);
+
+  useEffect(() => () => {
+    for (const timer of mainCompletionDismissTimersRef.current.values()) {
+      window.clearTimeout(timer);
+    }
+    mainCompletionDismissTimersRef.current.clear();
+  }, []);
+
+  const dismissMainCompletion = useCallback((sessionPath: string) => {
+    setMainCompletionByPath(prev => {
+      if (!prev[sessionPath]) return prev;
+      return { ...prev, [sessionPath]: 'dismissing' };
+    });
+
+    const existingTimer = mainCompletionDismissTimersRef.current.get(sessionPath);
+    if (existingTimer) window.clearTimeout(existingTimer);
+    const timer = window.setTimeout(() => {
+      mainCompletionDismissTimersRef.current.delete(sessionPath);
+      setMainCompletionByPath(prev => {
+        if (!prev[sessionPath]) return prev;
+        const next = { ...prev };
+        delete next[sessionPath];
+        return next;
+      });
+    }, MAIN_COMPLETION_DISMISS_MS);
+    mainCompletionDismissTimersRef.current.set(sessionPath, timer);
+  }, []);
+
+  useEffect(() => {
+    for (const [sessionPath, timer] of mainCompletionDismissTimersRef.current.entries()) {
+      if (!mainCompletionByPath[sessionPath]) {
+        window.clearTimeout(timer);
+        mainCompletionDismissTimersRef.current.delete(sessionPath);
+      }
+    }
+
+    for (const [sessionPath, state] of Object.entries(mainCompletionByPath)) {
+      if (state !== 'done' || mainCompletionDismissTimersRef.current.has(sessionPath)) continue;
+      const timer = window.setTimeout(() => {
+        dismissMainCompletion(sessionPath);
+      }, MAIN_COMPLETION_HOLD_MS);
+      mainCompletionDismissTimersRef.current.set(sessionPath, timer);
+    }
+  }, [dismissMainCompletion, mainCompletionByPath]);
+
+  useEffect(() => {
+    const updateAttentionState = () => {
+      setWindowAttentionActive(document.visibilityState !== 'hidden' && document.hasFocus());
+    };
+    updateAttentionState();
+    window.addEventListener('focus', updateAttentionState);
+    window.addEventListener('blur', updateAttentionState);
+    document.addEventListener('visibilitychange', updateAttentionState);
+    return () => {
+      window.removeEventListener('focus', updateAttentionState);
+      window.removeEventListener('blur', updateAttentionState);
+      document.removeEventListener('visibilitychange', updateAttentionState);
+    };
+  }, []);
+
+  const viewedSubagentSessionPath = useMemo(() => {
+    if (!windowAttentionActive || !currentSessionPath) return null;
+    const activeSession = sessions.find(s => s.path === currentSessionPath);
+    return isReadOnlySubagentSession(activeSession) ? activeSession?.path ?? null : null;
+  }, [currentSessionPath, sessions, windowAttentionActive]);
+
+  useEffect(() => {
+    if (!viewedSubagentSessionPath) return;
+    let cancelled = false;
+
+    const touchViewedSubagent = async () => {
+      try {
+        const touchRes = await hanaFetch('/api/sessions/subagent/touch', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ path: viewedSubagentSessionPath }),
+        });
+        const touchData = await touchRes.json();
+        const touchedModified = typeof touchData?.modified === 'string' ? touchData.modified : null;
+        if (cancelled || !touchedModified) return;
+        setCountdownNow(Date.now());
+        useStore.setState(prev => ({
+          sessions: prev.sessions.map((session: any) => (
+            session.path === viewedSubagentSessionPath ? { ...session, modified: touchedModified } : session
+          )),
+        }));
+      } catch (err) {
+        console.warn('[sessions] touch viewed subagent failed:', err);
+      }
+    };
+
+    void touchViewedSubagent();
+    const timer = window.setInterval(touchViewedSubagent, SUBAGENT_SESSION_TOUCH_INTERVAL_MS);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [viewedSubagentSessionPath]);
 
   useEffect(() => {
     const hasExpiredSubagent = sessions.some(s => {
-      const isSubagent = (s.collaborationKind === 'subagent' || s.kind === 'subagent') && s.readOnly;
+      const isSubagent = isReadOnlySubagentSession(s);
       if (!isSubagent || streamingSessions.includes(s.path)) return false;
+      if (deriveSubagentStatus(s) === 'running') return false;
+      if (windowAttentionActive && s.path === currentSessionPath) return false;
       const modifiedMs = Date.parse(s.modified || '');
       return Number.isFinite(modifiedMs) && countdownNow - modifiedMs >= SUBAGENT_SESSION_TTL_MS;
     });
     if (!hasExpiredSubagent) return;
     void loadSessions();
-  }, [countdownNow, sessions, streamingSessions]);
+  }, [countdownNow, currentSessionPath, sessions, streamingSessions, windowAttentionActive]);
 
   // Fetch browser sessions (re-fetch when browser state changes)
   useEffect(() => {
@@ -151,24 +393,36 @@ function SessionListInner() {
     return <div className={styles.sessionEmpty}>{t('sidebar.empty')}</div>;
   }
 
-  const sections = buildSessionSections(sessions, { mode: 'time' });
   const activeSessionPath = pendingSessionSwitchPath || currentSessionPath;
+  const sections = buildSessionSections(sessions, { mode: 'time' });
+
+  const renderSessionItem = (s: Session, isChild = false) => (
+    <SessionItem
+      key={s.path}
+      session={s}
+      isActive={!pendingNewSession && s.path === activeSessionPath}
+      isStreaming={streamingSessions.includes(s.path)}
+      mainCompletionState={mainCompletionByPath[s.path] || null}
+      mainTiming={mainTimingByPath[s.path] || null}
+      isPinned={!!s.pinnedAt}
+      isChild={isChild}
+      agents={agents}
+      browserState={browserSessions[s.path] || null}
+      countdownNow={countdownNow}
+      countdownPaused={windowAttentionActive && s.path === currentSessionPath && isReadOnlySubagentSession(s)}
+      onDismissMainCompletion={dismissMainCompletion}
+      onCloseBrowser={handleCloseBrowserSession}
+    />
+  );
 
   return (
     <>
       {sections.map(section => {
-        const items = section.items.map(s => (
-          <SessionItem
-            key={s.path}
-            session={s}
-            isActive={!pendingNewSession && s.path === activeSessionPath}
-            isStreaming={streamingSessions.includes(s.path) || !!s.pendingSubagent}
-            isPinned={!!s.pinnedAt}
-            agents={agents}
-            browserState={browserSessions[s.path] || null}
-            countdownNow={countdownNow}
-            onCloseBrowser={handleCloseBrowserSession}
-          />
+        const items = section.items.map(item => (
+          <Fragment key={item.session.path}>
+            {renderSessionItem(item.session)}
+            {item.children.map(child => renderSessionItem(child, true))}
+          </Fragment>
         ));
 
         if (section.kind === 'pinned') {
@@ -201,14 +455,19 @@ function SessionListInner() {
 
 // ── Session Item ──
 
-const SessionItem = memo(function SessionItem({ session: s, isActive, isStreaming, isPinned, agents, browserState, countdownNow, onCloseBrowser }: {
+const SessionItem = memo(function SessionItem({ session: s, isActive, isStreaming, mainCompletionState, mainTiming, isPinned, isChild, agents, browserState, countdownNow, countdownPaused, onDismissMainCompletion, onCloseBrowser }: {
   session: Session;
   isActive: boolean;
   isStreaming: boolean;
+  mainCompletionState: MainSessionCompletionState | null;
+  mainTiming: MainSessionTiming | null;
   isPinned: boolean;
+  isChild: boolean;
   agents: Agent[];
   browserState: BrowserSessionState | null;
   countdownNow: number;
+  countdownPaused: boolean;
+  onDismissMainCompletion: (sessionPath: string) => void;
   onCloseBrowser: (sessionPath: string) => void;
 }) {
   const { t } = useI18n();
@@ -217,20 +476,19 @@ const SessionItem = memo(function SessionItem({ session: s, isActive, isStreamin
   const [menuPosition, setMenuPosition] = useState<{ x: number; y: number } | null>(null);
   const [summaryPreviewPosition, setSummaryPreviewPosition] = useState<{ x: number; y: number } | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  const isCollaboration = s.collaborationKind === 'subagent' || s.kind === 'subagent';
 
   const handleClick = useCallback(() => {
     if (editing || s.pendingSubagent) return;
+    if (!isCollaboration && mainCompletionState) {
+      onDismissMainCompletion(s.path);
+    }
     switchSession(s.path);
-  }, [s.path, s.pendingSubagent, editing]);
+  }, [editing, isCollaboration, mainCompletionState, onDismissMainCompletion, s.path, s.pendingSubagent]);
 
   const handleArchive = useCallback((e: React.MouseEvent) => {
     e.stopPropagation();
     archiveSession(s.path);
-  }, [s.path]);
-
-  const handleDeleteSubagent = useCallback((e: React.MouseEvent) => {
-    e.stopPropagation();
-    deleteSubagentSession(s.path);
   }, [s.path]);
 
   const handlePin = useCallback((e: React.MouseEvent) => {
@@ -282,18 +540,54 @@ const SessionItem = memo(function SessionItem({ session: s, isActive, isStreamin
     }
   }, [editing]);
 
-  const isCollaboration = s.collaborationKind === 'subagent' || s.kind === 'subagent';
+  const subagentStatus: SubagentStatus = isCollaboration ? deriveSubagentStatus(s, isStreaming) : 'done';
+  const executorLabel = s.executorAgentName || s.agentName || s.executorAgentId || s.agentId || 'Agent';
+  const displayTitle = isCollaboration
+    ? stripTaskTitlePrefix(s.taskTitle || s.firstMessage || s.title || t('session.untitled'))
+    : (s.title || s.firstMessage || t('session.untitled'));
+  const timingSession = isCollaboration ? s : null;
+  const subagentTimingStatus = timingSession ? deriveSubagentStatus(timingSession) : null;
+  const timingStatus: 'running' | 'done' | null = isCollaboration
+    ? (subagentTimingStatus === 'running' ? 'running' : 'done')
+    : mainTiming
+      ? (mainTiming.completedAt ? 'done' : 'running')
+      : null;
+  const timingLabel = isCollaboration && timingSession
+    ? formatTaskDurationLabel(
+      timingSession.subagentStartedAt || subagentTaskStartFromId(timingSession.taskId),
+      subagentTimingStatus === 'running' ? null : (timingSession.subagentCompletedAt || timingSession.modified),
+      countdownNow,
+    )
+    : mainTiming
+      ? formatTaskDurationLabel(mainTiming.startedAt, mainTiming.completedAt, countdownNow)
+      : null;
+  const timingPrefix = timingStatus === 'running' ? '执行中' : '耗时';
 
   // Meta line
-  const parts: string[] = [];
+  const parts: ReactNode[] = [];
   if (isCollaboration) {
-    parts.push(s.pendingSubagent ? 'Agent 对话 · 建立中' : 'Agent 对话 · 只读');
+    parts.push(executorLabel);
   } else if (s.agentName || s.agentId) parts.push(s.agentName || s.agentId!);
-  if (s.cwd) {
+  if (timingLabel) {
+    parts.push(
+      <span className={styles.sessionTaskDuration} title={`${timingPrefix} ${timingLabel}`}>
+        <span>{timingPrefix}</span>
+        <span className={styles.sessionTaskDurationTime}>{timingLabel}</span>
+      </span>,
+    );
+  } else if (timingStatus === 'running') {
+    parts.push(<span className={styles.sessionTaskDuration}>执行中</span>);
+  } else if (s.cwd) {
     const dirName = s.cwd.split(/[/\\]/).filter(Boolean).pop();
     if (dirName) parts.push(dirName);
   }
-  if (s.modified) parts.push(formatSessionDate(s.modified));
+  if (s.modified) {
+    parts.push(
+      <span className={styles.sessionRelativeTime}>
+        {formatSessionDate(s.modified)}
+      </span>,
+    );
+  }
   const rcLabel = s.rcAttachment ? `${formatRcPlatform(s.rcAttachment.platform)} 接管中` : null;
   const browserUrl = browserState?.url || null;
   const browserTitle = [
@@ -316,7 +610,7 @@ const SessionItem = memo(function SessionItem({ session: s, isActive, isStreamin
   return (
     <>
       <button
-        className={`${styles.sessionItem}${isActive ? ` ${styles.sessionItemActive}` : ''}`}
+        className={`${styles.sessionItem}${isChild ? ` ${styles.sessionItemChild}` : ''}${s.readOnly ? ` ${styles.sessionItemReadOnly}` : ''}${isActive ? ` ${styles.sessionItemActive}` : ''}`}
         data-session-path={s.path}
         onClick={handleClick}
         onContextMenu={handleContextMenu}
@@ -333,9 +627,18 @@ const SessionItem = memo(function SessionItem({ session: s, isActive, isStreamin
           ) : s.agentId ? (
             <AgentBadge agentId={s.agentId} agentName={s.agentName} agents={agents} />
           ) : null}
-          {isStreaming && <span className={styles.sessionStreamingDot} />}
-          {isCollaboration && !isStreaming && !s.pendingSubagent && (
-            <SubagentCountdown modified={s.modified} now={countdownNow} />
+          {!isCollaboration && isStreaming && <SessionRunningRing label="执行中，等待任务完成" />}
+          {!isCollaboration && !isStreaming && mainCompletionState && (
+            <SessionDoneCheck
+              label="任务已完成，点击收起"
+              dismissing={mainCompletionState === 'dismissing'}
+            />
+          )}
+          {isCollaboration && subagentStatus === 'running' && (
+            <SessionRunningRing label="执行中，等待任务完成" />
+          )}
+          {isCollaboration && subagentStatus === 'done' && (
+            <SubagentCountdown modified={s.modified} now={countdownNow} paused={countdownPaused} />
           )}
           {editing ? (
             <input
@@ -349,7 +652,7 @@ const SessionItem = memo(function SessionItem({ session: s, isActive, isStreamin
             />
           ) : (
             <div className={styles.sessionItemTitle}>
-              {s.title || s.firstMessage || t('session.untitled')}
+              {displayTitle}
             </div>
           )}
         </div>
@@ -373,17 +676,7 @@ const SessionItem = memo(function SessionItem({ session: s, isActive, isStreamin
           </div>
         )}
 
-        {s.readOnly && isCollaboration && !s.pendingSubagent ? (
-          <div className={styles.sessionArchiveBtn} title="删除内部对话" onClick={handleDeleteSubagent}>
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <polyline points="3 6 5 6 21 6" />
-              <path d="M19 6l-1 14H6L5 6" />
-              <path d="M10 11v6" />
-              <path d="M14 11v6" />
-              <path d="M9 6V4h6v2" />
-            </svg>
-          </div>
-        ) : !s.readOnly && (
+        {!s.readOnly && (
           <div className={styles.sessionArchiveBtn} title={t('session.archive')} onClick={handleArchive}>
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
               <polyline points="21 8 21 21 3 21 3 8" />
@@ -393,8 +686,13 @@ const SessionItem = memo(function SessionItem({ session: s, isActive, isStreamin
           </div>
         )}
 
-        <div className={styles.sessionItemMeta}>
-          {parts.join(' · ')}
+        <div className={`${styles.sessionItemMeta}${isCollaboration ? ` ${styles.sessionItemMetaCollaboration}` : ''}`}>
+          {parts.map((part, index) => (
+            <Fragment key={index}>
+              {index > 0 && <span className={styles.sessionItemMetaSep}> · </span>}
+              {part}
+            </Fragment>
+          ))}
         </div>
 
         {rcLabel && (
@@ -627,12 +925,66 @@ function formatRcPlatform(platform: string) {
 // ── Agent Avatar Badge ──
 
 
-const SubagentCountdown = memo(function SubagentCountdown({ modified, now }: {
+const SessionRunningRing = memo(function SessionRunningRing({ label }: { label: string }) {
+  const radius = 6;
+  const circumference = 2 * Math.PI * radius;
+
+  return (
+    <span className={`${styles.sessionCountdown} ${styles.sessionCountdownRunning}`} title={label} aria-label={label}>
+      <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
+        <circle className={styles.sessionCountdownTrack} cx="8" cy="8" r={radius} />
+        <circle
+          className={styles.sessionCountdownSpinner}
+          cx="8"
+          cy="8"
+          r={radius}
+          strokeDasharray={`${circumference * 0.72} ${circumference}`}
+        />
+      </svg>
+    </span>
+  );
+});
+
+const SessionDoneCheck = memo(function SessionDoneCheck({ label, dismissing = false }: {
+  label: string;
+  dismissing?: boolean;
+}) {
+  const radius = 6;
+  const circumference = 2 * Math.PI * radius;
+
+  return (
+    <span
+      className={`${styles.sessionCountdown} ${styles.sessionCountdownDone} ${styles.sessionCountdownSafe}${dismissing ? ` ${styles.sessionCountdownDismissing}` : ''}`}
+      title={label}
+      aria-label={label}
+    >
+      <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
+        <circle className={styles.sessionCountdownTrack} cx="8" cy="8" r={radius} />
+        <circle
+          className={styles.sessionCountdownValue}
+          cx="8"
+          cy="8"
+          r={radius}
+          strokeDasharray={circumference}
+          strokeDashoffset={0}
+        />
+      </svg>
+      <span className={styles.sessionCountdownCheck} aria-hidden="true">
+        <svg width="9" height="9" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M2.2 6.2 4.8 8.8 9.8 3.2" />
+        </svg>
+      </span>
+    </span>
+  );
+});
+
+const SubagentCountdown = memo(function SubagentCountdown({ modified, now, paused }: {
   modified: string | null;
   now: number;
+  paused: boolean;
 }) {
   const modifiedMs = Date.parse(modified || '');
-  const remaining = Number.isFinite(modifiedMs)
+  const remaining = paused ? SUBAGENT_SESSION_TTL_MS : Number.isFinite(modifiedMs)
     ? Math.max(0, SUBAGENT_SESSION_TTL_MS - (now - modifiedMs))
     : SUBAGENT_SESSION_TTL_MS;
   const ratio = Math.max(0, Math.min(1, remaining / SUBAGENT_SESSION_TTL_MS));
@@ -645,9 +997,10 @@ const SubagentCountdown = memo(function SubagentCountdown({ modified, now }: {
   const circumference = 2 * Math.PI * radius;
   const dashOffset = circumference * (1 - ratio);
   const minutes = Math.ceil(remaining / 60000);
+  const label = paused ? '正在查看，自动删除计时已暂停' : `${minutes} 分钟后自动删除`;
 
   return (
-    <span className={`${styles.sessionCountdown} ${colorClass}`} title={`${minutes} 分钟后自动删除`} aria-label={`${minutes} 分钟后自动删除`}>
+    <span className={`${styles.sessionCountdown} ${styles.sessionCountdownDone} ${colorClass}`} title={label} aria-label={label}>
       <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
         <circle className={styles.sessionCountdownTrack} cx="8" cy="8" r={radius} />
         <circle
@@ -659,6 +1012,11 @@ const SubagentCountdown = memo(function SubagentCountdown({ modified, now }: {
           strokeDashoffset={dashOffset}
         />
       </svg>
+      <span className={styles.sessionCountdownCheck} aria-hidden="true">
+        <svg width="9" height="9" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M2.2 6.2 4.8 8.8 9.8 3.2" />
+        </svg>
+      </span>
     </span>
   );
 });
@@ -670,13 +1028,16 @@ const AgentPairBadge = memo(function AgentPairBadge({ requesterAgentId, requeste
   executorAgentName: string | null;
   agents: Agent[];
 }) {
+  const hasExecutor = !!executorAgentId;
   return (
-    <span className={styles.sessionAgentPairBadge} title={`${requesterAgentName || requesterAgentId || 'Agent'} ↔ ${executorAgentName || executorAgentId || 'Agent'}`}>
-      {requesterAgentId && (
-        <AgentBadge agentId={requesterAgentId} agentName={requesterAgentName} agents={agents} />
-      )}
-      <span className={styles.sessionAgentPairArrow}>↔</span>
-      {executorAgentId && (
+    <span className={styles.sessionAgentPairBadge} title={`${requesterAgentName || requesterAgentId || 'Agent'} → ${executorAgentName || executorAgentId || 'Agent'}`}>
+      <span className={styles.sessionDelegationArrow} aria-hidden="true">
+        <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M3.2 2.5v4.1a2 2 0 0 0 2 2h5.2" />
+          <path d="M8.2 6.4l2.4 2.2-2.4 2.2" />
+        </svg>
+      </span>
+      {hasExecutor && (
         <AgentBadge agentId={executorAgentId} agentName={executorAgentName} agents={agents} />
       )}
     </span>
