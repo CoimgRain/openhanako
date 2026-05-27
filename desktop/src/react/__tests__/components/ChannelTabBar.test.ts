@@ -2,12 +2,14 @@
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { loadChannelsMock, openChannelMock } = vi.hoisted(() => ({
+const { hydrateCurrentChannelIfNeededMock, loadChannelsMock, openChannelMock } = vi.hoisted(() => ({
+  hydrateCurrentChannelIfNeededMock: vi.fn(() => Promise.resolve()),
   loadChannelsMock: vi.fn(),
   openChannelMock: vi.fn(),
 }));
 
 vi.mock('../../stores/channel-actions', () => ({
+  hydrateCurrentChannelIfNeeded: hydrateCurrentChannelIfNeededMock,
   loadChannels: loadChannelsMock,
   openChannel: openChannelMock,
 }));
@@ -75,6 +77,7 @@ describe('ChannelTabBar switchTab', () => {
     switchTab('channels');
 
     expect(useStore.getState().currentTab).toBe('channels');
+    expect(hydrateCurrentChannelIfNeededMock).toHaveBeenCalledTimes(1);
     expect(openChannelMock).toHaveBeenCalledWith('ch_crew', false);
     expect(loadChannelsMock).not.toHaveBeenCalled();
   });
@@ -82,6 +85,7 @@ describe('ChannelTabBar switchTab', () => {
   it('refreshes the channel list when entering channels without a selection', () => {
     switchTab('channels');
 
+    expect(hydrateCurrentChannelIfNeededMock).toHaveBeenCalledTimes(1);
     expect(loadChannelsMock).toHaveBeenCalledTimes(1);
     expect(openChannelMock).not.toHaveBeenCalled();
   });

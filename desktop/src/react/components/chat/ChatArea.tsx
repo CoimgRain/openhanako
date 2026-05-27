@@ -9,6 +9,7 @@ import { memo, useRef, useEffect, useState, useCallback, useMemo } from 'react';
 import type { PointerEvent as ReactPointerEvent } from 'react';
 import { useStore } from '../../stores';
 import { loadMoreMessages } from '../../stores/session-actions';
+import { captureChatSelection } from '../../stores/selection-actions';
 import { hanaUrl } from '../../hooks/use-hana-fetch';
 import { useContinuousBottomScroll } from '../../hooks/use-continuous-bottom-scroll';
 

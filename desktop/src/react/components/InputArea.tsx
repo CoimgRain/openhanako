@@ -1200,7 +1200,7 @@ function InputAreaInner({ surface }: Required<InputAreaProps>) {
       <InputContextRow
         attachedFiles={attachedFiles}
         removeAttachedFile={removeAttachedFile}
-        hasQuotedSelection={!!quotedSelection}
+        hasQuotedSelection={quotedSelections.length > 0}
         sessionTodos={sessionTodos}
         onCompleteTodos={handleCompleteTodos}
         completingTodos={completingTodos}

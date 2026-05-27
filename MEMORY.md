@@ -243,3 +243,11 @@
 - 改动：在 `/Users/kang/.ssh/config` 新增 `Host air-via-a1`，通过 `ProxyJump a1` 访问 A1 上的 `127.0.0.1:22022`，用户为 `kang`，使用现有 `~/.ssh/sortify_server` key，并设置 SSH keepalive 与 `HostKeyAlias macbook-air-via-a1`。
 - 验证：`ssh -G air-via-a1` 已确认别名解析为 `ProxyJump a1`、目标 `127.0.0.1:22022`；`ssh a1` 可登录。实际 `ssh air-via-a1` 当前因 A1 上未检测到 Air 反向隧道监听 `22022` 而 `Connection refused`，说明 Pro 侧最后一步已补齐，但 Air 侧隧道需要在线后才能连通。
 - 风险/后续：未修改 `TODO.md`；若 Air 侧端口不是 `22022` 或 Air 登录用户名/授权 key 不同，需按实际 Air 侧配置调整该别名。
+
+## 2026-05-27 18:48
+
+- 目标：按 `UPSTREAM_SYNC.md` 将原作者 `upstream/main` 更新合并进本地定制分支，并保留本地修改优先。
+- 背景：用户要求检查原作者 GitHub 是否有新版本，若有则与当前本地/个人 GitHub 分支合并；合并前必须先提交当前状态，便于出问题时回溯。
+- 改动：先将未提交的 `MEMORY.md` 记录提交为 checkpoint `e3c7c977 保存上游同步前当前状态`；从 `upstream/main` 拉取到最新 `v0.243.0`，在临时分支 `sync-upstream-2026-05-27` 使用 `git merge -X ours upstream/main` 合并 154 个上游提交；保留本地 `AGENTS.md`、`MEMORY.md`、`TODO.md`、`UPSTREAM_SYNC.md`；修复合并后前端编译问题，补齐 channel hydrate、聊天选区捕获、输入引用状态与 session 搜索状态；更新 `ChannelTabBar` 测试 mock。
+- 验证：`npm run typecheck` 通过；`npm test -- desktop/src/react/__tests__/components/ChatArea.continuous-scroll.test.tsx desktop/src/react/__tests__/components/InputArea.media-send.test.tsx desktop/src/react/__tests__/components/SessionListContextMenu.test.tsx desktop/src/react/__tests__/components/ChannelTabBar.test.ts` 通过，4 个测试文件、28 个测试通过。
+- 风险/后续：本轮未运行全量测试；上游跨度较大，后续若发现运行时 UI 回归，应优先检查合并涉及的聊天、频道、SessionList、图片生成和新插件功能。

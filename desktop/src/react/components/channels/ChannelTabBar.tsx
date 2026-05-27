@@ -11,7 +11,7 @@ import type { TabType, PluginPageInfo } from '../../types';
 import { toggleSidebar } from '../SidebarLayout';
 import { resolvePluginTitle } from '../../utils/resolve-plugin-title';
 import { reorderTabs, hidePluginTab, showPluginTab } from '../../stores/plugin-ui-actions';
-import { loadChannels, openChannel } from '../../stores/channel-actions';
+import { hydrateCurrentChannelIfNeeded, loadChannels, openChannel } from '../../stores/channel-actions';
 import { PluginTabOverflow } from '../plugin/PluginTabOverflow';
 import { ContextMenu, type ContextMenuItem } from '../../ui';
 import styles from './Channels.module.css';

@@ -173,6 +173,10 @@ function SessionListInner() {
   const browserBySession = useStore(s => s.browserBySession);
 
   const [browserSessions, setBrowserSessions] = useState<Record<string, BrowserSessionState>>({});
+  const [searchQuery, setSearchQuery] = useState('');
+  const [titleResults, setTitleResults] = useState<SessionSearchResult[]>([]);
+  const [contentResults, setContentResults] = useState<SessionSearchResult[]>([]);
+  const [searchStatus, setSearchStatus] = useState<'idle' | 'title' | 'content' | 'done' | 'error'>('idle');
   const [countdownNow, setCountdownNow] = useState(() => Date.now());
   const [windowAttentionActive, setWindowAttentionActive] = useState(() => (
     document.visibilityState !== 'hidden' && document.hasFocus()
@@ -182,6 +186,10 @@ function SessionListInner() {
   const closingBrowserSessionsRef = useRef(new Set<string>());
   const previousStreamingPathsRef = useRef<Set<string> | null>(null);
   const mainCompletionDismissTimersRef = useRef(new Map<string, number>());
+  const searchQueryTrimmed = searchQuery.trim();
+  const sessionsSignature = useMemo(() => (
+    sessions.map(s => `${s.path}:${s.title || ''}:${s.modified || ''}:${s.messageCount}`).join('\n')
+  ), [sessions]);
 
   const setVisibleBrowserSessions = useCallback((data: unknown) => {
     const states = normalizeBrowserSessionStates(data);
@@ -471,10 +479,6 @@ function SessionListInner() {
     }
   }, []);
 
-  if (sessions.length === 0) {
-    return <div className={styles.sessionEmpty}>{t('sidebar.empty')}</div>;
-  }
-
   const activeSessionPath = pendingSessionSwitchPath || currentSessionPath;
   const sections = buildSessionSections(sessions, { mode: 'time' });
 
@@ -497,40 +501,68 @@ function SessionListInner() {
     />
   );
 
+  const titleResultPaths = new Set(titleResults.map(result => result.path));
+  const visibleContentResults = contentResults.filter(result => !titleResultPaths.has(result.path));
+  const hasSearchResults = titleResults.length > 0 || visibleContentResults.length > 0;
+  const isSearching = !!searchQueryTrimmed;
+  const showEmptyState = sessions.length === 0 && !isSearching;
+  const content = showEmptyState ? (
+    <div className={styles.sessionEmpty}>{t('sidebar.empty')}</div>
+  ) : isSearching ? (
+    <SessionSearchResults
+      titleResults={titleResults}
+      contentResults={visibleContentResults}
+      status={searchStatus}
+      hasResults={hasSearchResults}
+      agents={agents}
+      activeSessionPath={activeSessionPath}
+      pendingNewSession={pendingNewSession}
+    />
+  ) : (
+    sections.map(section => {
+      const items = section.items.map(item => (
+        <Fragment key={item.session.path}>
+          {renderSessionItem(item.session)}
+          {item.children.map(child => renderSessionItem(child, true))}
+        </Fragment>
+      ));
+
+      if (section.kind === 'pinned') {
+        return (
+          <section key={section.id} className={styles.pinnedSection}>
+            <div className={`${styles.sessionSectionTitle} ${styles.pinnedSectionTitle}`}>
+              <span>{t(section.titleKey)}</span>
+              <svg className={styles.pinnedTitleIcon} width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                <path d="M12 17v5" />
+                <path d="M5 17h14" />
+                <path d="M7 3h10l-2 9H9L7 3z" />
+                <path d="M9 12l-2 5h10l-2-5" />
+              </svg>
+            </div>
+            {items}
+          </section>
+        );
+      }
+
+      return (
+        <Fragment key={section.id}>
+          <div className={styles.sessionSectionTitle}>{t(section.titleKey)}</div>
+          {items}
+        </Fragment>
+      );
+    })
+  );
+
   return (
     <>
-      {sections.map(section => {
-        const items = section.items.map(item => (
-          <Fragment key={item.session.path}>
-            {renderSessionItem(item.session)}
-            {item.children.map(child => renderSessionItem(child, true))}
-          </Fragment>
-        ));
-
-        if (section.kind === 'pinned') {
-          return (
-            <section key={section.id} className={styles.pinnedSection}>
-              <div className={`${styles.sessionSectionTitle} ${styles.pinnedSectionTitle}`}>
-                <span>{t(section.titleKey)}</span>
-                <svg className={styles.pinnedTitleIcon} width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-                  <path d="M12 17v5" />
-                  <path d="M5 17h14" />
-                  <path d="M7 3h10l-2 9H9L7 3z" />
-                  <path d="M9 12l-2 5h10l-2-5" />
-                </svg>
-              </div>
-              {items}
-            </section>
-          );
-        }
-
-        return (
-          <Fragment key={section.id}>
-            <div className={styles.sessionSectionTitle}>{t(section.titleKey)}</div>
-            {items}
-          </Fragment>
-        );
-      })}
+      <SessionSearchBox
+        value={searchQuery}
+        onChange={setSearchQuery}
+        onClear={() => setSearchQuery('')}
+      />
+      <div className={styles.sessionListScroller}>
+        {content}
+      </div>
     </>
   );
 }
