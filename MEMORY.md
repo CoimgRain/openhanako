@@ -251,3 +251,11 @@
 - 改动：先将未提交的 `MEMORY.md` 记录提交为 checkpoint `e3c7c977 保存上游同步前当前状态`；从 `upstream/main` 拉取到最新 `v0.243.0`，在临时分支 `sync-upstream-2026-05-27` 使用 `git merge -X ours upstream/main` 合并 154 个上游提交；保留本地 `AGENTS.md`、`MEMORY.md`、`TODO.md`、`UPSTREAM_SYNC.md`；修复合并后前端编译问题，补齐 channel hydrate、聊天选区捕获、输入引用状态与 session 搜索状态；更新 `ChannelTabBar` 测试 mock。
 - 验证：`npm run typecheck` 通过；`npm test -- desktop/src/react/__tests__/components/ChatArea.continuous-scroll.test.tsx desktop/src/react/__tests__/components/InputArea.media-send.test.tsx desktop/src/react/__tests__/components/SessionListContextMenu.test.tsx desktop/src/react/__tests__/components/ChannelTabBar.test.ts` 通过，4 个测试文件、28 个测试通过。
 - 风险/后续：本轮未运行全量测试；上游跨度较大，后续若发现运行时 UI 回归，应优先检查合并涉及的聊天、频道、SessionList、图片生成和新插件功能。
+
+## 2026-05-27 18:54
+
+- 目标：启动合并上游后的开发版供用户检查，并修复启动期发现的运行时问题。
+- 背景：开发版启动后 server 在 `14501` 正常监听，但切换会话触发 `isActiveDesktopSessionPath is not defined`；同时本机 `better-sqlite3` native addon 曾因 Node 25/22 ABI 不一致导致焦点 agent runtime 初始化失败。
+- 改动：在 `server/routes/sessions.js` 补齐 `isActiveDesktopSessionPath` import；使用当前 Node 22.22.2 执行 `npm rebuild better-sqlite3`，使 native addon ABI 回到 `NODE_MODULE_VERSION 127`。
+- 验证：`node -e "require('better-sqlite3')"` 通过；`npm run typecheck` 通过；`npm test -- tests/message-utils.test.js desktop/src/react/__tests__/components/ChannelTabBar.test.ts desktop/src/react/__tests__/components/ChatArea.continuous-scroll.test.tsx desktop/src/react/__tests__/components/InputArea.media-send.test.tsx desktop/src/react/__tests__/components/SessionListContextMenu.test.tsx` 通过，5 个测试文件、57 个测试通过。
+- 风险/后续：`tests/sessions-route.test.js` 在本轮合并后仍有若干上游搜索/历史窗口 mock 相关失败，暂未作为打开开发版前置阻塞；正式构建前如时间允许可继续对齐该测试文件。

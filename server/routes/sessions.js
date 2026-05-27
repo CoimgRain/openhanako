@@ -27,6 +27,7 @@ import {
   loadSessionHistoryMessages,
   loadLatestAssistantSummaryFromSessionFile,
   isValidSessionPath,
+  isActiveDesktopSessionPath,
   isActiveSessionPath,
   isSubagentSessionPath,
 } from "../../core/message-utils.js";
