@@ -275,3 +275,11 @@
 - 改动：在 `server/routes/sessions.js` 的 `/sessions/messages` 历史 hydrate 循环中修正 user 消息分支：恢复按 `displayIdx/pageBounds` 分页、写入 `messages`，并保留本地 subagent human message 展示清洗逻辑；不再引用合并残留的未定义 `allMessages/globalIdx`。
 - 验证：`node --check server/routes/sessions.js` 通过；`npm test -- tests/message-utils.test.js tests/session-coordinator.test.js desktop/src/react/__tests__/components/SessionListContextMenu.test.tsx` 通过，3 个测试文件、89 个测试通过；重启开发版后直接请求用户截图中的子任务 session `/api/sessions/messages` 返回 200，解析到 `messages 14`。
 - 风险/后续：当前修复针对消息加载 500；如果 DevTools 仍保留旧红色记录，需要刷新/重新点击会话确认新请求状态。本轮未新增 TODO。
+
+## 2026-05-27 19:27
+
+- 目标：把合并上游并修复后的当前版本构建安装为本机 `/Applications/Hanako Plus.app`，同时保留用户正式数据。
+- 背景：用户确认开发版可用后，要求按之前 Plus 方式正式编译并替换应用；旧 Plus 为 `0.222.8`，新代码版本为 `0.243.0`，正式数据依赖 `CFBundleIdentifier=com.hanako.app` 与 `/Users/kang/Library/Application Support/Hanako`。
+- 改动：运行 `npm run pack` 生成 `dist/mac-arm64/HanaAgent.app`；notarization 因缺少 Apple app-specific password 在最后失败，但 app 产物已生成。停止旧 Plus 14500 进程，备份旧应用到 `/Applications/Hanako Plus.app.backup-20260527-191518`，复制新产物到 `/Applications/Hanako Plus.app`。为保留用户熟悉名称，将主 executable、`CFBundleName`、`CFBundleDisplayName` 以及 Electron Helper app/executable 全部改为 `Hanako Plus`；保留 `CFBundleIdentifier=com.hanako.app`，并 patch `app.asar` 中 `package.json` 的 `productName=Hanako Plus`。重新移除 quarantine 并 ad-hoc codesign。
+- 验证：`codesign --verify --deep --strict /Applications/Hanako\ Plus.app` 通过；启动后主进程和 Helper 均显示 `Hanako Plus`，server 监听 `14500`，进程使用正式数据目录 `/Users/kang/Library/Application Support/Hanako`；带 `/Users/kang/.hanako/server-info.json` token 请求 `/api/health` 返回 `status: ok`、`version: 0.243.0`。
+- 风险/后续：本机安装为 ad-hoc 签名且未 notarize，适合本机使用；若未来再次从上游 `HanaAgent.app` 打包 Plus，必须同步重命名 Electron Helper，否则会触发 `Unable to find helper app` 启动崩溃。
