@@ -259,3 +259,11 @@
 - 改动：在 `server/routes/sessions.js` 补齐 `isActiveDesktopSessionPath` import；使用当前 Node 22.22.2 执行 `npm rebuild better-sqlite3`，使 native addon ABI 回到 `NODE_MODULE_VERSION 127`。
 - 验证：`node -e "require('better-sqlite3')"` 通过；`npm run typecheck` 通过；`npm test -- tests/message-utils.test.js desktop/src/react/__tests__/components/ChannelTabBar.test.ts desktop/src/react/__tests__/components/ChatArea.continuous-scroll.test.tsx desktop/src/react/__tests__/components/InputArea.media-send.test.tsx desktop/src/react/__tests__/components/SessionListContextMenu.test.tsx` 通过，5 个测试文件、57 个测试通过。
 - 风险/后续：`tests/sessions-route.test.js` 在本轮合并后仍有若干上游搜索/历史窗口 mock 相关失败，暂未作为打开开发版前置阻塞；正式构建前如时间允许可继续对齐该测试文件。
+
+## 2026-05-27 18:59
+
+- 目标：修复开发版 UI 中 `/api/sessions/new` 500，解除新建聊天失败。
+- 背景：合并上游 `v0.243.0` 后，用户在开发版窗口看到新建 session 失败；复现接口返回 `normalizeStringArray is not defined`，说明上游 session prompt snapshot/cache 相关实现合入时 import 缺失。
+- 改动：在 `core/session-coordinator.js` 补齐 `cache-prefix-contract` 与 `session-prompt-snapshot` 相关 import，包括 `normalizeStringArray`、`SESSION_PROMPT_SNAPSHOT_VERSION`、`freezeAgentsFilesResult`、`freezeSkillsResult`、`normalizeSessionPromptSnapshot` 等。
+- 验证：`node --check core/session-coordinator.js` 和 `node --check server/routes/sessions.js` 通过；`npm test -- tests/session-coordinator.test.js tests/message-utils.test.js desktop/src/react/__tests__/components/SessionListContextMenu.test.tsx` 通过，3 个测试文件、89 个测试通过；重启开发版后直接调用 `POST http://127.0.0.1:14501/api/sessions/new` 返回 200，并创建新 session。
+- 风险/后续：本轮为合并漏 import 的运行时修复；若继续遇到 500，应继续按接口返回 error 字段定位上游合并遗漏。

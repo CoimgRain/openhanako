@@ -57,6 +57,18 @@ import {
   deleteSubagentSessionMeta,
   readSubagentSessionMetaSync,
 } from "../lib/subagent-executor-metadata.js";
+import {
+  buildLlmContextCachePrefixContract,
+  diffCachePrefixContracts,
+  summarizeCachePrefixContract,
+} from "../lib/llm/cache-prefix-contract.js";
+import {
+  SESSION_PROMPT_SNAPSHOT_VERSION,
+  freezeAgentsFilesResult,
+  freezeSkillsResult,
+  normalizeSessionPromptSnapshot,
+  normalizeStringArray,
+} from "./session-prompt-snapshot.js";
 import { deleteSessionFileSidecarSync } from "../lib/session-files/session-file-registry.js";
 import { deleteSessionSkillSnapshotSync } from "../lib/skills/session-skill-snapshot.js";
 
