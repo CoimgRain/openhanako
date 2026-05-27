@@ -607,15 +607,20 @@ export function createSessionsRoute(engine, hub = null) {
 
       for (const m of sourceMessages) {
         if (m.role === "user") {
-          const { text, images } = extractTextContent(m.content);
-          const displayed = normalizeDisplayedUserText(text);
-          if (displayed.text || images.length) {
-            allMessages.push({
-              id: String(globalIdx),
+          if (!isDisplayableHistoryMessage(m)) continue;
+          const currentIndex = displayIdx;
+          displayIdx += 1;
+          if (currentIndex >= pageBounds.startIdx && currentIndex < pageBounds.endIdx) {
+            const { text, images } = extractTextContent(m.content);
+            const displayed = normalizeDisplayedUserText(text);
+            const visibleImages = filterUnreferencedInlineImages(displayed.text || text, images);
+            if (!displayed.text && visibleImages.length === 0) continue;
+            messages.push({
+              id: String(currentIndex),
               ...(m.id ? { entryId: m.id } : {}),
               role: "user",
               content: displayed.text,
-              images: images.length ? images : undefined,
+              images: visibleImages.length ? visibleImages : undefined,
               ...((m.source || displayed.source) ? { source: m.source || displayed.source } : {}),
               ...(m.timestamp ? { timestamp: m.timestamp } : {}),
             });
