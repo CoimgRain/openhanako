@@ -3,6 +3,8 @@
  *
  * GET    /skills              — 列出所有可用 skill（含当前 agent 的 enabled 状态）
  * PUT    /agents/:id/skills   — 更新指定 agent 的 enabled skills 列表
+ * PATCH  /agents/:id/skills/:name — 增量启用/停用单个 skill
+ * PATCH  /agents/:id/skill-bundles/:bundleId — 增量启用/停用 bundle 内 skills
  * POST   /skills/install      — 安装用户技能（文件夹路径 / .zip / .skill）
  * DELETE /skills/:name        — 删除用户技能
  */
@@ -11,15 +13,15 @@ import fs from "fs";
 import { Hono } from "hono";
 import { emitAppEvent } from "../app-events.js";
 import { safeJson } from "../hono-helpers.js";
-import { extractZip } from "../../lib/extract-zip.js";
 import { saveConfig } from "../../lib/memory/config-loader.js";
-import { sanitizeSkillName } from "../../lib/tools/install-skill.js";
+import {
+  installSkillPackageFromPath,
+  sanitizeSkillName,
+} from "../../lib/skills/skill-package-installer.js";
 import { t } from "../i18n.js";
-import { safeCopyDir } from "../../shared/safe-fs.js";
 import { resolveAgent } from "../utils/resolve-agent.js";
 import { validateId, agentExists } from "../utils/validation.js";
 import { registerSessionFileFromRequest } from "../../lib/session-files/session-file-response.js";
-import { createSkillSourceIdentity } from "../../lib/skills/skill-file-identity.js";
 import {
   createSkillBundle,
   deleteSkillBundle,
@@ -29,23 +31,34 @@ import {
   updateSkillBundle,
 } from "../../lib/skill-bundles/store.js";
 import { exportSkillBundlePackage } from "../../lib/skill-bundles/package-service.js";
+import { createModuleLogger } from "../../lib/debug-log.js";
 
-/** 从 SKILL.md frontmatter 解析 name */
-function parseSkillName(skillMdPath) {
-  try {
-    const content = fs.readFileSync(skillMdPath, "utf-8");
-    const fmMatch = content.match(/^---\s*\n([\s\S]*?)\n---/);
-    if (!fmMatch) return null;
-    const nameMatch = fmMatch[1].match(/^name:\s*(.+)$/m);
-    return nameMatch ? nameMatch[1].trim().replace(/^["']|["']$/g, "") : null;
-  } catch {
-    return null;
-  }
-}
+const log = createModuleLogger("skills");
 
 /** 递归删除目录 */
 function rmDirSync(dir) {
   fs.rmSync(dir, { recursive: true, force: true });
+}
+
+function installErrorMessage(err, sourcePath) {
+  switch (err?.code) {
+    case "SKILL_SOURCE_MUST_BE_ABSOLUTE":
+      return t("error.skillNeedAbsolutePath");
+    case "SKILL_SOURCE_NOT_FOUND":
+      return t("error.skillPathNotExists");
+    case "SKILL_UNSUPPORTED_FORMAT":
+      return t("error.skillUnsupportedFormat");
+    case "SKILL_MISSING_SKILL_MD": {
+      const isArchive = [".zip", ".skill"].includes(path.extname(sourcePath || "").toLowerCase());
+      return isArchive ? t("error.skillMissingSkillMdInZip") : t("error.skillMissingSkillMd");
+    }
+    case "SKILL_MISSING_NAME":
+      return t("error.skillMissingName");
+    case "SKILL_INVALID_NAME":
+      return t("error.skillNameInvalid", { name: "" });
+    default:
+      return err?.message || "skill install failed";
+  }
 }
 
 export function createSkillsRoute(engine) {
@@ -58,6 +71,20 @@ export function createSkillsRoute(engine) {
     let resolve;
     _installLock = new Promise(r => { resolve = r; });
     return prev.then(fn).finally(resolve);
+  }
+
+  const agentSkillWriteLocks = new Map();
+
+  function withAgentSkillWriteLock(agentId, fn) {
+    const prev = agentSkillWriteLocks.get(agentId) || Promise.resolve();
+    const run = prev.catch(() => {}).then(fn);
+    const cleanup = run.finally(() => {
+      if (agentSkillWriteLocks.get(agentId) === cleanup) {
+        agentSkillWriteLocks.delete(agentId);
+      }
+    });
+    agentSkillWriteLocks.set(agentId, cleanup);
+    return cleanup;
   }
 
   function bundleForResponse(bundle, skillByName = new Map()) {
@@ -116,6 +143,57 @@ export function createSkillsRoute(engine) {
         throw err;
       }
     }
+  }
+
+  function validateAgentIdOrResponse(c, id) {
+    if (!validateId(id) || !agentExists(engine, id)) {
+      return c.json({ error: "agent not found" }, 404);
+    }
+    return null;
+  }
+
+  async function persistEnabledSkills(agentId, enabled) {
+    const partial = { skills: { enabled } };
+
+    // 走 engine.updateConfig (ConfigCoordinator)，它会在 partial.skills 存在时
+    // 调用 syncAgentSkills 把新 enabled 列表同步到 agent 的内存态和 system prompt。
+    // 直接调 agent.updateConfig 会绕过这一步，导致写盘成功但内存未刷新。
+    const agent = engine.getAgent?.(agentId);
+    if (agent) {
+      await engine.updateConfig(partial, { agentId });
+    } else {
+      const configPath = path.join(engine.agentsDir, agentId, "config.yaml");
+      saveConfig(configPath, partial);
+    }
+    return enabled;
+  }
+
+  function visibleSkillsForAgent(agentId) {
+    const skills = engine.getAllSkills(agentId) || [];
+    return {
+      skills,
+      visibleSet: new Set(skills.map(skill => skill.name)),
+    };
+  }
+
+  async function writeSkillDelta(agentId, skillNames, enable) {
+    const requested = [...new Set(skillNames.filter(name => typeof name === "string" && name.trim()))];
+    return withAgentSkillWriteLock(agentId, async () => {
+      const { skills, visibleSet } = visibleSkillsForAgent(agentId);
+      const changed = requested.filter(name => visibleSet.has(name));
+      const currentEnabled = new Set(skills.filter(skill => skill.enabled).map(skill => skill.name));
+      if (enable) {
+        for (const name of changed) currentEnabled.add(name);
+      } else {
+        for (const name of changed) currentEnabled.delete(name);
+      }
+      const enabled = skills
+        .map(skill => skill.name)
+        .filter(name => currentEnabled.has(name));
+      await persistEnabledSkills(agentId, enabled);
+      emitAppEvent(engine, "skills-changed", { agentId });
+      return { enabled, changed };
+    });
   }
 
   route.get("/skills/bundles", async (c) => {
@@ -221,9 +299,8 @@ export function createSkillsRoute(engine) {
 
   route.put("/agents/:id/skills", async (c) => {
     const id = c.req.param("id");
-    if (!validateId(id) || !agentExists(engine, id)) {
-      return c.json({ error: "agent not found" }, 404);
-    }
+    const invalidAgent = validateAgentIdOrResponse(c, id);
+    if (invalidAgent) return invalidAgent;
     try {
       const body = await safeJson(c);
       const { enabled } = body;
@@ -237,23 +314,56 @@ export function createSkillsRoute(engine) {
       const visibleSet = new Set(visible);
       const filtered = enabled.filter(name => visibleSet.has(name));
 
-      const partial = { skills: { enabled: filtered } };
-
-      // 走 engine.updateConfig (ConfigCoordinator)，它会在 partial.skills 存在时
-      // 调用 syncAgentSkills 把新 enabled 列表同步到 agent 的内存态和 system prompt。
-      // 直接调 agent.updateConfig 会绕过这一步，导致写盘成功但内存未刷新。
-      const agent = engine.getAgent(id);
-      if (agent) {
-        await engine.updateConfig(partial, { agentId: id });
-      } else {
-        const configPath = path.join(engine.agentsDir, id, "config.yaml");
-        saveConfig(configPath, partial);
-      }
-
-      emitAppEvent(engine, "skills-changed", { agentId: id });
-      return c.json({ ok: true, enabled: filtered });
+      const persisted = await withAgentSkillWriteLock(id, async () => {
+        await persistEnabledSkills(id, filtered);
+        emitAppEvent(engine, "skills-changed", { agentId: id });
+        return filtered;
+      });
+      return c.json({ ok: true, enabled: persisted });
     } catch (err) {
       return c.json({ error: err.message }, 500);
+    }
+  });
+
+  route.patch("/agents/:id/skills/:name", async (c) => {
+    const id = c.req.param("id");
+    const invalidAgent = validateAgentIdOrResponse(c, id);
+    if (invalidAgent) return invalidAgent;
+    try {
+      const body = await safeJson(c);
+      if (typeof body.enabled !== "boolean") {
+        return c.json({ error: "enabled must be a boolean" }, 400);
+      }
+      const name = c.req.param("name");
+      const { visibleSet } = visibleSkillsForAgent(id);
+      if (!visibleSet.has(name)) {
+        return c.json({ error: "skill not found" }, 404);
+      }
+      const result = await writeSkillDelta(id, [name], body.enabled);
+      return c.json({ ok: true, ...result });
+    } catch (err) {
+      return c.json({ error: err.message }, 500);
+    }
+  });
+
+  route.patch("/agents/:id/skill-bundles/:bundleId", async (c) => {
+    const id = c.req.param("id");
+    const invalidAgent = validateAgentIdOrResponse(c, id);
+    if (invalidAgent) return invalidAgent;
+    try {
+      const body = await safeJson(c);
+      if (typeof body.enabled !== "boolean") {
+        return c.json({ error: "enabled must be a boolean" }, 400);
+      }
+      const store = loadSkillBundleStore(engine);
+      const bundle = store.bundles.find(item => item.id === c.req.param("bundleId"));
+      if (!bundle) {
+        return c.json({ error: "skill bundle not found" }, 404);
+      }
+      const result = await writeSkillDelta(id, bundle.skillNames, body.enabled);
+      return c.json({ ok: true, ...result });
+    } catch (err) {
+      return c.json({ error: err.message }, err.status || 500);
     }
   });
 
@@ -280,87 +390,19 @@ export function createSkillsRoute(engine) {
       });
 
       const userDir = engine.userSkillsDir;
-      const stat = fs.statSync(srcPath);
-
-      let skillDir; // 最终包含 SKILL.md 的目录
-
-      if (stat.isDirectory()) {
-        // 直接是文件夹
-        if (!fs.existsSync(path.join(srcPath, "SKILL.md"))) {
-          return c.json({ error: t("error.skillMissingSkillMd") }, 400);
-        }
-        skillDir = srcPath;
-      } else {
-        // .zip 或 .skill 文件
-        const ext = path.extname(srcPath).toLowerCase();
-        if (ext !== ".zip" && ext !== ".skill") {
-          return c.json({ error: t("error.skillUnsupportedFormat") }, 400);
-        }
-
-        // 解压到临时目录
-        const tmpDir = path.join(userDir, ".tmp-install-" + Date.now());
-        fs.mkdirSync(tmpDir, { recursive: true });
-        try {
-          await extractZip(srcPath, tmpDir);
-
-          // 找到 SKILL.md：可能在根目录或一层子目录内
-          if (fs.existsSync(path.join(tmpDir, "SKILL.md"))) {
-            skillDir = tmpDir;
-          } else {
-            const sub = fs.readdirSync(tmpDir, { withFileTypes: true })
-              .filter(e => e.isDirectory() && !e.name.startsWith("."));
-            const found = sub.find(e => fs.existsSync(path.join(tmpDir, e.name, "SKILL.md")));
-            if (found) {
-              skillDir = path.join(tmpDir, found.name);
-            } else {
-              rmDirSync(tmpDir);
-              return c.json({ error: t("error.skillMissingSkillMdInZip") }, 400);
-            }
-          }
-        } catch (err) {
-          rmDirSync(tmpDir);
-          return c.json({ error: t("error.skillExtractFailed", { msg: err.message }) }, 400);
-        }
+      let installed;
+      try {
+        // 手动安装（用户行为）不做 LLM 安全审查，只做包结构和文件系统安全校验。
+        installed = await installSkillPackageFromPath({
+          sourcePath: srcPath,
+          installDir: userDir,
+          owner: "user",
+        });
+      } catch (err) {
+        return c.json({ error: installErrorMessage(err, srcPath) }, err.status || 400);
       }
-
-      // 解析技能名称
-      const skillName = parseSkillName(path.join(skillDir, "SKILL.md"));
-      if (!skillName) {
-        // 清理临时目录
-        if (skillDir !== srcPath) rmDirSync(path.dirname(skillDir) === userDir ? skillDir : path.join(userDir, ".tmp-install-" + Date.now()));
-        return c.json({ error: t("error.skillMissingName") }, 400);
-      }
-
-      // 安全校验名称
-      const safeName = sanitizeSkillName(skillName);
-      if (!safeName) {
-        return c.json({ error: t("error.skillNameInvalid", { name: skillName }) }, 400);
-      }
-
-      // 手动安装（用户行为）不做安全审查，直接放行
-
-      // 复制到用户技能目录
-      const dstDir = path.join(userDir, safeName);
-      if (skillDir === srcPath) {
-        // 文件夹模式：复制
-        safeCopyDir(skillDir, dstDir);
-      } else {
-        // zip 解压模式：移动（从临时目录）
-        if (fs.existsSync(dstDir)) rmDirSync(dstDir);
-        fs.renameSync(skillDir, dstDir);
-        // 简单处理：找到 .tmp-install- 前缀的目录并清理
-        for (const entry of fs.readdirSync(userDir)) {
-          if (entry.startsWith(".tmp-install-")) {
-            rmDirSync(path.join(userDir, entry));
-          }
-        }
-      }
-      const installedSkillSource = createSkillSourceIdentity({
-        owner: "user",
-        skillName: safeName,
-        filePath: path.join(dstDir, "SKILL.md"),
-        baseDir: dstDir,
-      });
+      const safeName = installed.name;
+      const installedSkillSource = installed.installedSkillSource;
 
       // 重新加载 skills
       await engine.reloadSkills();
@@ -395,7 +437,7 @@ export function createSkillsRoute(engine) {
         ...(sourceFile ? { sourceFile } : {}),
       });
     } catch (err) {
-      console.error("[skills] install failed:", err);
+      log.error(`install failed: ${err?.stack || err}`);
       return c.json({ error: err.message }, 500);
     }
     }); // withInstallLock
@@ -442,23 +484,16 @@ export function createSkillsRoute(engine) {
         return c.json({ error: t("error.skillInvalidName") }, 400);
       }
 
-      // SkillsTab 的 per-agent selector 会显式带上 agentId,此时必须严格按该 agent
-      // 定位 learned-skills 目录,不能 fallback 到焦点 agent(#419 cross-agent 串删)。
-      // 历史调用方(无 query 参数)仍走 resolveAgent 保持兼容。
       const queryAgentId = c.req.query("agentId");
       let targetAgentId;
-      let agentDir;
       if (queryAgentId) {
         if (!validateId(queryAgentId) || !agentExists(engine, queryAgentId)) {
           return c.json({ error: "agent not found" }, 404);
         }
         targetAgentId = queryAgentId;
-        agentDir = engine.getAgent(queryAgentId)?.agentDir
-          || path.join(engine.agentsDir, queryAgentId);
       } else {
         const resolved = resolveAgent(engine, c);
-        agentDir = resolved?.agentDir;
-        targetAgentId = agentDir ? path.basename(agentDir) : "";
+        targetAgentId = resolved?.agentDir ? path.basename(resolved.agentDir) : "";
       }
 
       // 外部技能不可删除（用该 agent 的视角查 readonly 即可，与 enabled 无关）
@@ -468,21 +503,13 @@ export function createSkillsRoute(engine) {
         return c.json({ error: t("error.skillExternalCannotDelete") }, 403);
       }
 
-      // 优先查用户技能目录，再查 agent 自学目录
       const userSkillPath = path.join(engine.skillsDir, name);
-      const learnedSkillPath = agentDir ? path.join(agentDir, "learned-skills", name) : null;
-
-      let skillPath;
-      if (fs.existsSync(userSkillPath)) {
-        skillPath = userSkillPath;
-      } else if (learnedSkillPath && fs.existsSync(learnedSkillPath)) {
-        skillPath = learnedSkillPath;
-      } else {
+      if (!fs.existsSync(userSkillPath)) {
         return c.json({ error: t("error.skillNotExists") }, 404);
       }
 
       // 删除目录
-      rmDirSync(skillPath);
+      rmDirSync(userSkillPath);
 
       // 从所有 agent 的 enabled 列表中移除
       const agentsDir = engine.agentsDir;
@@ -498,7 +525,7 @@ export function createSkillsRoute(engine) {
             saveConfig(configPath, { skills: { enabled: filtered } });
           }
         } catch (e) {
-          console.error(`[skills] 清理 agent ${agentName} 的 skill 引用失败:`, e.message);
+          log.error(`清理 agent ${agentName} 的 skill 引用失败: ${e.message}`);
         }
       }
 

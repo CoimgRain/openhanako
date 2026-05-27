@@ -4,12 +4,6 @@ import path from "path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { updateAgentPhoneProjectionMeta } from "../lib/conversations/agent-phone-projection.js";
 
-const freshCompactAgentPhoneSessionMock = vi.fn(async () => ({ fresh: true }));
-
-vi.mock("../hub/agent-executor.js", () => ({
-  freshCompactAgentPhoneSession: (...args) => freshCompactAgentPhoneSessionMock(...args),
-}));
-
 import { FreshCompactMaintainer } from "../hub/fresh-compact-maintainer.js";
 
 let rootDir;
@@ -25,15 +19,20 @@ function makeAgent(id = "agent-a") {
 describe("FreshCompactMaintainer", () => {
   beforeEach(() => {
     rootDir = fs.mkdtempSync(path.join(os.tmpdir(), "fresh-maintainer-"));
-    freshCompactAgentPhoneSessionMock.mockClear();
   });
 
   afterEach(() => {
     fs.rmSync(rootDir, { recursive: true, force: true });
   });
 
-  it("runs stale bridge and phone fresh-compacts from the background maintainer", async () => {
+  it("runs stale bridge fresh-compacts and leaves stale phone sessions alone", async () => {
     const agent = makeAgent();
+    const bridgeFile = path.join(agent.sessionDir, "bridge", "owner", "owner.jsonl");
+    fs.mkdirSync(path.dirname(bridgeFile), { recursive: true });
+    fs.writeFileSync(bridgeFile, "", "utf-8");
+    agent.memoryTicker = {
+      flushSessionAndCompile: vi.fn(async () => {}),
+    };
     const phoneFile = path.join(agent.agentDir, "phone", "sessions", "ch_crew", "phone.jsonl");
     fs.mkdirSync(path.dirname(phoneFile), { recursive: true });
     fs.writeFileSync(phoneFile, "", "utf-8");
@@ -49,7 +48,7 @@ describe("FreshCompactMaintainer", () => {
     });
 
     const bridgeSessionManager = {
-      listDailyFreshCompactTargets: vi.fn(() => [{ sessionKey: "tg_dm_owner" }]),
+      listDailyFreshCompactTargets: vi.fn(() => [{ sessionKey: "tg_dm_owner", sessionPath: bridgeFile }]),
       freshCompactSession: vi.fn(async () => ({ fresh: true })),
     };
     const engine = {
@@ -66,18 +65,62 @@ describe("FreshCompactMaintainer", () => {
     const result = await maintainer.runDaily({ now });
 
     expect(bridgeSessionManager.listDailyFreshCompactTargets).toHaveBeenCalledWith(agent, { now });
+    expect(agent.memoryTicker.flushSessionAndCompile).toHaveBeenCalledWith(bridgeFile);
     expect(bridgeSessionManager.freshCompactSession).toHaveBeenCalledWith("tg_dm_owner", {
       agentId: agent.id,
       reason: "daily",
       now,
     });
-    expect(freshCompactAgentPhoneSessionMock).toHaveBeenCalledWith(agent.id, {
-      engine,
-      conversationId: "ch_crew",
-      conversationType: "channel",
+    expect(agent.memoryTicker.flushSessionAndCompile.mock.invocationCallOrder[0])
+      .toBeLessThan(bridgeSessionManager.freshCompactSession.mock.invocationCallOrder[0]);
+    expect(result).toMatchObject({
+      bridgeCompacted: 1,
+      phoneCompacted: 0,
+      failed: 0,
+      staleRemaining: 0,
+    });
+  });
+
+  it("marks an already-compacted stale bridge target without flushing memory first", async () => {
+    const agent = makeAgent();
+    const bridgeFile = path.join(agent.sessionDir, "bridge", "owner", "already.jsonl");
+    fs.mkdirSync(path.dirname(bridgeFile), { recursive: true });
+    fs.writeFileSync(bridgeFile, JSON.stringify({ type: "compaction", summary: "done" }) + "\n", "utf-8");
+    agent.memoryTicker = {
+      flushSessionAndCompile: vi.fn(async () => {}),
+    };
+
+    const bridgeSessionManager = {
+      listDailyFreshCompactTargets: vi.fn(() => [{ sessionKey: "tg_dm_already", sessionPath: bridgeFile }]),
+      isFreshCompactAlreadySatisfied: vi.fn(() => ({ satisfied: true, reason: "already_compacted" })),
+      markFreshCompactSatisfied: vi.fn(async () => ({ fresh: true, noop: true })),
+      freshCompactSession: vi.fn(async () => ({ fresh: true })),
+    };
+    const engine = {
+      agents: new Map([[agent.id, agent]]),
+      getAgent: (id) => (id === agent.id ? agent : null),
+      bridgeSessionManager,
+    };
+    const maintainer = new FreshCompactMaintainer({
+      hub: { engine },
+      delayBetweenJobsMs: 0,
+    });
+    const now = new Date(2026, 4, 15, 4, 10);
+
+    const result = await maintainer.runDaily({ now });
+
+    expect(bridgeSessionManager.isFreshCompactAlreadySatisfied).toHaveBeenCalledWith("tg_dm_already", {
+      agentId: agent.id,
+      sessionPath: bridgeFile,
+    });
+    expect(bridgeSessionManager.markFreshCompactSatisfied).toHaveBeenCalledWith("tg_dm_already", {
+      agentId: agent.id,
       now,
       reason: "daily",
+      noopReason: "already_compacted",
     });
-    expect(result).toMatchObject({ bridgeCompacted: 1, phoneCompacted: 1 });
+    expect(agent.memoryTicker.flushSessionAndCompile).not.toHaveBeenCalled();
+    expect(bridgeSessionManager.freshCompactSession).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ bridgeCompacted: 1, failed: 0, staleRemaining: 0 });
   });
 });

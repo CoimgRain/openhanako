@@ -35,7 +35,10 @@ import {
 } from "../../lib/tools/experience.js";
 import { splitByScope, injectGlobalFields } from '../../shared/config-scope.js';
 import { validateId, agentExists } from "../utils/validation.js";
-import { OPTIONAL_TOOL_NAMES } from "../../shared/tool-categories.js";
+import {
+  OPTIONAL_TOOL_NAMES,
+  computeSettingsAvailableToolNames,
+} from "../../shared/tool-categories.js";
 import {
   buildInlineProviderCredentialUpdate,
   clearInlineProviderCredentialFields,
@@ -50,6 +53,10 @@ import {
 } from "../../shared/secret-custody.js";
 import { denySecretMutationWithoutScope, denyWithoutScope } from "../http/capability-guard.js";
 import { recordSecurityAuditEvent } from "../http/security-audit.js";
+import { assertAgentConfigPatchYuan } from "../../core/yuan-registry.js";
+import { createModuleLogger } from "../../lib/debug-log.js";
+
+const log = createModuleLogger("agents");
 
 // ── 工具函数 ──
 
@@ -187,7 +194,7 @@ export function createAgentsRoute(engine) {
       emitAppEvent(engine, "agent-created", { agentId: result.id, name: result.name });
       return c.json({ ok: true, ...result });
     } catch (err) {
-      return c.json({ error: err.message }, err.message.includes("已存在") ? 409 : 500);
+      return c.json({ error: err.message }, err.statusCode || (err.message.includes("已存在") ? 409 : 500));
     }
   });
 
@@ -402,23 +409,26 @@ export function createAgentsRoute(engine) {
         config.providers = {};
       }
 
-      // Expose the agent's currently-registered tool name list so the settings
-      // UI can decide which optional-tool toggles to render. Uses the keyed
-      // engine.getAgent(id) lookup rather than the focus pointer — state
+      // Expose a stable settings tool surface. Runtime tool names are included
+      // for compatibility, but optional toggles must not disappear just because
+      // a non-focused agent has only loaded config and not initialized runtime
+      // tools yet. Uses keyed lookup rather than the focus pointer — state
       // ownership must be uniquely determined, not derived from focus.
       const agent = engine.getAgent(id);
+      const pluginTools = engine.pluginManager?.getAllTools?.() || [];
       if (!agent) {
         // agentExists(engine, id) already guarded above; reaching here means
         // engine.getAgent diverged from agentExists. That's a bug, not a missing
         // resource — log it but don't 500 the response.
-        console.warn(
+        log.warn(
           `GET /agents/${id}/config: agent not found by keyed lookup despite passing agentExists check`
         );
-        config.availableTools = [];
+        config.availableTools = computeSettingsAvailableToolNames([], { pluginTools });
       } else {
-        config.availableTools = (agent.tools || [])
+        const runtimeToolNames = (agent.tools || [])
           .map((t) => t.name)
           .filter(Boolean);
+        config.availableTools = computeSettingsAvailableToolNames(runtimeToolNames, { pluginTools });
       }
 
       return c.json(maskObjectSecrets(config));
@@ -545,6 +555,8 @@ export function createAgentsRoute(engine) {
           agentPartial.memory.reenableAt = now;
         }
       }
+
+      assertAgentConfigPatchYuan(engine.productDir, agentPartial);
 
       const configPath = path.join(agentDir(engine, id), "config.yaml");
       saveConfig(configPath, agentPartial);

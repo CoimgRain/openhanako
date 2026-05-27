@@ -7,7 +7,10 @@ vi.mock("../lib/bridge/telegram-adapter.js", () => ({ createTelegramAdapter: vi.
 vi.mock("../lib/bridge/feishu-adapter.js", () => ({ createFeishuAdapter: vi.fn() }));
 vi.mock("../lib/bridge/qq-adapter.js", () => ({ createQQAdapter: vi.fn() }));
 vi.mock("../lib/bridge/wechat-adapter.js", () => ({ createWechatAdapter: vi.fn() }));
-vi.mock("../lib/debug-log.js", () => ({ debugLog: () => null }));
+vi.mock("../lib/debug-log.js", () => ({
+  debugLog: () => null,
+  createModuleLogger: () => ({ log: vi.fn(), warn: vi.fn(), error: vi.fn() }),
+}));
 
 import { BridgeManager } from "../lib/bridge/bridge-manager.js";
 
@@ -141,6 +144,9 @@ describe("BridgeManager session_file media delivery", () => {
       hanakoHome: tmpDir,
       agent: null,
       agentName: "Hana",
+      deferredResults: {
+        markDelivered: vi.fn(),
+      },
       getAgent: vi.fn(() => ({ agentName: "Hana" })),
       getSessionFile: vi.fn((id) => id === "sf_generated" ? sessionFile : null),
       getBridgeContextForSessionPath: vi.fn((sp) => sp === sessionPath ? {
@@ -181,6 +187,7 @@ describe("BridgeManager session_file media delivery", () => {
     await new Promise((resolve) => setImmediate(resolve));
 
     expect(adapter.sendMediaBuffer).toHaveBeenCalledOnce();
+    expect(engine.deferredResults.markDelivered).toHaveBeenCalledWith("task_1");
     expect(adapter.sendMediaBuffer.mock.calls[0][0]).toBe("chat-1");
     expect(Buffer.isBuffer(adapter.sendMediaBuffer.mock.calls[0][1])).toBe(true);
     expect(adapter.sendMediaBuffer.mock.calls[0][2]).toEqual({

@@ -51,6 +51,9 @@ import {
 } from "../../lib/conversations/agent-phone-projection.js";
 import { resolveAgent } from "../utils/resolve-agent.js";
 import { findModel } from "../../shared/model-ref.js";
+import { createModuleLogger } from "../../lib/debug-log.js";
+
+const log = createModuleLogger("channel");
 
 function normalizeOptionalPositiveInt(value, fieldName) {
   if (value === undefined || value === null || value === "") return null;
@@ -162,6 +165,18 @@ function assertAvailableModelOverride(engine, settings) {
 export function createChannelsRoute(engine, hub) {
   const route = new Hono();
 
+  function isPhoneEnabled() {
+    return engine.isChannelsEnabled?.() !== false;
+  }
+
+  function phoneDisabledResponse(c) {
+    return c.json({ error: "Agent phone is disabled" }, 503);
+  }
+
+  function requirePhoneEnabled(c) {
+    return isPhoneEnabled() ? null : phoneDisabledResponse(c);
+  }
+
   /** 用户 bookmark 文件路径 */
   function userBookmarkPath() {
     return path.join(engine.userDir, "channel-bookmarks.md");
@@ -189,6 +204,8 @@ export function createChannelsRoute(engine, hub) {
   }
 
   route.get("/conversations/:id/agent-activities", async (c) => {
+    const disabled = requirePhoneEnabled(c);
+    if (disabled) return disabled;
     const id = c.req.param("id");
     return c.json({
       activities: hub?.agentPhoneActivities?.snapshot?.(id) || [],
@@ -285,6 +302,8 @@ export function createChannelsRoute(engine, hub) {
 
   route.get("/conversations/:id/agent-phone-settings", async (c) => {
     try {
+      const disabled = requirePhoneEnabled(c);
+      if (disabled) return disabled;
       const id = c.req.param("id");
       return c.json(await readConversationPhoneSettings(id, c));
     } catch (err) {
@@ -294,6 +313,8 @@ export function createChannelsRoute(engine, hub) {
 
   route.post("/conversations/:id/agent-phone-settings", async (c) => {
     try {
+      const disabled = requirePhoneEnabled(c);
+      if (disabled) return disabled;
       const id = c.req.param("id");
       const body = await safeJson(c);
       const settings = normalizePhoneSettingsPayload(body);
@@ -306,6 +327,8 @@ export function createChannelsRoute(engine, hub) {
 
   route.get("/conversations/:id/agent-phone-tool-mode", async (c) => {
     try {
+      const disabled = requirePhoneEnabled(c);
+      if (disabled) return disabled;
       const settings = await readConversationPhoneSettings(c.req.param("id"), c);
       return c.json({ mode: settings.mode });
     } catch (err) {
@@ -315,6 +338,8 @@ export function createChannelsRoute(engine, hub) {
 
   route.post("/conversations/:id/agent-phone-tool-mode", async (c) => {
     try {
+      const disabled = requirePhoneEnabled(c);
+      if (disabled) return disabled;
       const id = c.req.param("id");
       const current = await readConversationPhoneSettings(id, c).catch(() => ({
         ...DEFAULT_AGENT_PHONE_SETTINGS,
@@ -332,6 +357,8 @@ export function createChannelsRoute(engine, hub) {
   // ── 列出所有频道 ──
   route.get("/channels", async (c) => {
     try {
+      const disabled = requirePhoneEnabled(c);
+      if (disabled) return disabled;
       const channelsDir = engine.channelsDir;
       if (!channelsDir || !fs.existsSync(channelsDir)) {
         return c.json({ channels: [], bookmarks: {} });
@@ -387,6 +414,8 @@ export function createChannelsRoute(engine, hub) {
   // ── 创建新频道 ──
   route.post("/channels", async (c) => {
     try {
+      const disabled = requirePhoneEnabled(c);
+      if (disabled) return disabled;
       const body = await safeJson(c);
       const { name, description, members, intro } = body;
 
@@ -402,6 +431,12 @@ export function createChannelsRoute(engine, hub) {
 
       const channelsDir = engine.channelsDir;
       fs.mkdirSync(channelsDir, { recursive: true });
+
+      for (const memberId of normalizedMembers) {
+        if (!safeAgentDir(memberId)) {
+          return c.json({ error: `Agent not found: ${memberId}`, code: "CHANNEL_AGENT_NOT_FOUND" }, 404);
+        }
+      }
 
       const { id: channelId } = await createChannel(channelsDir, {
         name,
@@ -436,6 +471,8 @@ export function createChannelsRoute(engine, hub) {
   // ── 获取频道消息 ──
   route.get("/channels/:name", async (c) => {
     try {
+      const disabled = requirePhoneEnabled(c);
+      if (disabled) return disabled;
       const name = c.req.param("name");
       const filePath = safeChannelPath(name);
       if (!filePath) return c.json({ error: "Invalid channel id" }, 400);
@@ -463,6 +500,8 @@ export function createChannelsRoute(engine, hub) {
   // ── 添加频道成员 ──
   route.post("/channels/:name/members", async (c) => {
     try {
+      const disabled = requirePhoneEnabled(c);
+      if (disabled) return disabled;
       const name = c.req.param("name");
       const filePath = safeChannelPath(name);
       if (!filePath) return c.json({ error: "Invalid channel id" }, 400);
@@ -491,6 +530,8 @@ export function createChannelsRoute(engine, hub) {
   // ── 移除频道成员 ──
   route.delete("/channels/:name/members/:memberId", async (c) => {
     try {
+      const disabled = requirePhoneEnabled(c);
+      if (disabled) return disabled;
       const name = c.req.param("name");
       const memberId = c.req.param("memberId");
       const filePath = safeChannelPath(name);
@@ -514,6 +555,11 @@ export function createChannelsRoute(engine, hub) {
       if (agentDir) {
         await removeBookmarkEntry(path.join(agentDir, "channels.md"), name);
       }
+      hub?.abortAgentPhoneSessions?.("channel-member-removed", {
+        agentId: memberId,
+        conversationId: name,
+        conversationType: "channel",
+      });
 
       debugLog()?.log("api", `DELETE /channels/${name}/members/${memberId}`);
       return c.json({ ok: true, members: nextMembers });
@@ -525,9 +571,8 @@ export function createChannelsRoute(engine, hub) {
   // ── 用户发送消息 ──
   route.post("/channels/:name/messages", async (c) => {
     try {
-      if (!engine.isChannelsEnabled?.()) {
-        return c.json({ error: "Channels are disabled" }, 503);
-      }
+      const disabled = requirePhoneEnabled(c);
+      if (disabled) return disabled;
       const name = c.req.param("name");
       const filePath = safeChannelPath(name);
       if (!filePath) return c.json({ error: "Invalid channel id" }, 400);
@@ -555,7 +600,7 @@ export function createChannelsRoute(engine, hub) {
 
       const triggerDelivery = hub.triggerChannelDelivery || hub.triggerChannelTriage;
       triggerDelivery.call(hub, name, { mentionedAgents })?.catch(err =>
-        console.error(`[channel] 触发手机送达失败: ${err.message}`)
+        log.error(`触发手机送达失败: ${err.message}`)
       );
 
       return c.json({ ok: true, timestamp: result.timestamp });
@@ -567,6 +612,8 @@ export function createChannelsRoute(engine, hub) {
   // ── 更新用户已读 bookmark ──
   route.post("/channels/:name/read", async (c) => {
     try {
+      const disabled = requirePhoneEnabled(c);
+      if (disabled) return disabled;
       const name = c.req.param("name");
       const filePath = safeChannelPath(name);
       if (!filePath) return c.json({ error: "Invalid channel id" }, 400);
@@ -588,6 +635,8 @@ export function createChannelsRoute(engine, hub) {
   // ── 删除频道 ──
   route.delete("/channels/:name", async (c) => {
     try {
+      const disabled = requirePhoneEnabled(c);
+      if (disabled) return disabled;
       const name = c.req.param("name");
       const filePath = safeChannelPath(name);
       if (!filePath) return c.json({ error: "Invalid channel id" }, 400);

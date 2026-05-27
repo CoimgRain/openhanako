@@ -12,6 +12,7 @@ describe("DeferredResultCoordinator", () => {
     store = new DeferredResultStore();
     sessionCoordinator = {
       deliverCustomMessage: vi.fn().mockResolvedValue({ ok: true, mode: "triggerTurn" }),
+      recordCustomEntry: vi.fn().mockResolvedValue({ ok: true, mode: "customEntry" }),
     };
     coordinator = new DeferredResultCoordinator({
       store,
@@ -42,6 +43,69 @@ describe("DeferredResultCoordinator", () => {
     expect(store.query("task-1")).toMatchObject({ delivered: true });
   });
 
+  it("records UI-only media results as non-context custom entries without waking the parent agent", async () => {
+    const sessionFile = {
+      fileId: "sf_img",
+      filePath: "/cache/generated.png",
+      mime: "image/png",
+      kind: "image",
+    };
+    store.defer("task-img", "/sessions/a.jsonl", {
+      type: "image-generation",
+      mediaKind: "image",
+      deliveryIntent: "ui_only",
+      prompt: "moon",
+    });
+    store.resolve("task-img", { sessionFiles: [sessionFile] });
+
+    await vi.waitFor(() => {
+      expect(sessionCoordinator.recordCustomEntry).toHaveBeenCalledOnce();
+    });
+
+    expect(sessionCoordinator.deliverCustomMessage).not.toHaveBeenCalled();
+    expect(sessionCoordinator.recordCustomEntry).toHaveBeenCalledWith(
+      "/sessions/a.jsonl",
+      "hana-deferred-result",
+      expect.objectContaining({
+        schemaVersion: 1,
+        taskId: "task-img",
+        status: "success",
+        type: "image-generation",
+        result: { sessionFiles: [sessionFile] },
+      }),
+    );
+    expect(store.query("task-img")).toMatchObject({ delivered: true });
+  });
+
+  it("wakes the parent agent when a UI-only image generation task fails with failure notification enabled", async () => {
+    store.defer("task-img-fail", "/sessions/a.jsonl", {
+      type: "image-generation",
+      mediaKind: "image",
+      deliveryIntent: "ui_only",
+      triggerParentTurn: false,
+      notifyAgentOnFailure: true,
+      prompt: "moon",
+    });
+    store.fail("task-img-fail", "quota exhausted");
+
+    await vi.waitFor(() => {
+      expect(sessionCoordinator.deliverCustomMessage).toHaveBeenCalledOnce();
+    });
+
+    expect(sessionCoordinator.recordCustomEntry).not.toHaveBeenCalled();
+    expect(sessionCoordinator.deliverCustomMessage).toHaveBeenCalledWith(
+      "/sessions/a.jsonl",
+      expect.objectContaining({
+        customType: "hana-background-result",
+        display: false,
+        content: expect.stringContaining("status=\"failed\""),
+      }),
+      { triggerTurn: true },
+    );
+    expect(sessionCoordinator.deliverCustomMessage.mock.calls[0][1].content).toContain("quota exhausted");
+    expect(store.query("task-img-fail")).toMatchObject({ delivered: true });
+  });
+
   it("keeps undelivered tasks when custom message delivery fails", async () => {
     sessionCoordinator.deliverCustomMessage.mockRejectedValueOnce(new Error("session unavailable"));
     store.defer("task-2", "/sessions/a.jsonl", { type: "subagent" });
@@ -69,5 +133,66 @@ describe("DeferredResultCoordinator", () => {
 
     expect(sessionCoordinator.deliverCustomMessage).toHaveBeenCalledOnce();
     expect(store.query("task-3")).toMatchObject({ delivered: true });
+  });
+
+  it("delivers aborted tasks without triggering the parent agent turn", async () => {
+    store.defer("task-4", "/sessions/a.jsonl", { type: "subagent" });
+    store.abort("task-4", "user stopped");
+
+    await vi.waitFor(() => {
+      expect(sessionCoordinator.deliverCustomMessage).toHaveBeenCalledOnce();
+    });
+
+    expect(sessionCoordinator.deliverCustomMessage).toHaveBeenCalledWith(
+      "/sessions/a.jsonl",
+      expect.objectContaining({ customType: "hana-background-result" }),
+      { triggerTurn: false },
+    );
+    expect(store.query("task-4")).toMatchObject({ delivered: true });
+  });
+
+  it("suppresses old undelivered results when the parent session is no longer runnable", async () => {
+    sessionCoordinator.isRunnableSessionPath = vi.fn(() => false);
+    store._tasks.set("task-5", {
+      status: "resolved",
+      sessionPath: "/sessions/archived/a.jsonl",
+      meta: { type: "subagent" },
+      deferredAt: Date.now(),
+      result: "done",
+      reason: null,
+      delivered: false,
+    });
+
+    await coordinator.flushUndelivered();
+
+    expect(sessionCoordinator.deliverCustomMessage).not.toHaveBeenCalled();
+    expect(store.query("task-5")).toMatchObject({
+      delivered: true,
+      deliverySuppressed: true,
+    });
+  });
+
+  it("leaves bridge-targeted results for bridge delivery instead of suppressing them as non-desktop sessions", async () => {
+    sessionCoordinator.isRunnableSessionPath = vi.fn(() => false);
+    store._tasks.set("task-bridge", {
+      status: "resolved",
+      sessionPath: "/agents/hanako/sessions/bridge/owner/chat.jsonl",
+      meta: {
+        type: "image-generation",
+        deliveryTarget: { kind: "bridge", platform: "wechat", chatId: "wx-user" },
+      },
+      deferredAt: Date.now(),
+      result: { sessionFiles: [{ id: "sf_bridge" }] },
+      reason: null,
+      delivered: false,
+    });
+
+    await coordinator.flushUndelivered();
+
+    expect(sessionCoordinator.deliverCustomMessage).not.toHaveBeenCalled();
+    expect(store.query("task-bridge")).toMatchObject({
+      delivered: false,
+    });
+    expect(store.query("task-bridge").deliverySuppressed).toBeUndefined();
   });
 });

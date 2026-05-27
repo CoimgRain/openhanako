@@ -1,5 +1,5 @@
 /**
- * Hanako Server — HTTP + WebSocket API
+ * HanaAgent Server — HTTP + WebSocket API
  *
  * 启动方式：
  *   node server/index.js              （独立运行）
@@ -12,16 +12,20 @@ import fs from "fs";
 import { setMaxListeners } from "events";
 import path from "path";
 import { Hono } from "hono";
-import { serve } from "@hono/node-server";
+import { createAdaptorServer } from "@hono/node-server";
 import { createNodeWebSocket } from "@hono/node-ws";
 import { WebSocketServer } from "ws";
 import { AppError } from "../shared/errors.js";
 import { errorBus } from "../shared/error-bus.js";
 import { HanaEngine } from "../core/engine.js";
 import { ensureFirstRun } from "../core/first-run.js";
-import { initDebugLog } from "../lib/debug-log.js";
+import { initDebugLog, createModuleLogger } from "../lib/debug-log.js";
 import { redactLogLabel, redactLogText } from "../lib/log-redactor.js";
 import { safeJson } from "./hono-helpers.js";
+
+const log = createModuleLogger("server");
+const checkpointLog = createModuleLogger("checkpoint");
+const sessionFilesLog = createModuleLogger("session-files");
 import { createOutboundProxyRuntime } from "../lib/net/outbound-proxy.js";
 import { createServerAuthService } from "../core/server-auth.js";
 import { resolveServerListenOptions } from "../core/server-network-config.js";
@@ -58,9 +62,11 @@ import { createCheckpointsRoute } from "./routes/checkpoints.js";
 import { createCommandsRoute } from "./routes/commands.js";
 import { createServerIdentityRoute } from "./routes/server-identity.js";
 import { createResourcesRoute } from "./routes/resources.js";
+import { createUsageRoute } from "./routes/usage.js";
 import { createWebAuthRoute } from "./routes/web-auth.js";
 import { createMobileWorkbenchRoute } from "./routes/mobile-workbench.js";
 import { createMobileStaticRoute } from "./routes/mobile-static.js";
+import { createHtmlPreviewRoute } from "./routes/html-preview.js";
 import { createAccessRoute } from "./routes/access.js";
 import { configureProcessPiSdkEnv, ensureHanaPiSdkDirs, resolveHanakoHome } from "../shared/hana-runtime-paths.js";
 // internal-browser WS is handled directly via raw ws.WebSocketServer in the
@@ -74,8 +80,94 @@ import { createCompactionGuardExtension } from "../lib/extensions/compaction-gua
 import { Hub } from "../hub/index.js";
 import { startCLI } from "./cli.js";
 import { fromRoot } from "../shared/hana-root.js";
+import { callText } from "../core/llm-client.js";
 
 const productDir = fromRoot("lib");
+
+async function bindServerTransportOwnership(server, { host, port, listenHost, networkMode }) {
+  try {
+    await new Promise((resolve, reject) => {
+      const cleanup = () => {
+        server.off("listening", onListening);
+        server.off("error", onError);
+      };
+      const onListening = () => {
+        cleanup();
+        resolve();
+      };
+      const onError = (err) => {
+        cleanup();
+        reject(err);
+      };
+      server.once("listening", onListening);
+      server.once("error", onError);
+      server.listen(port, host);
+    });
+  } catch (err) {
+    const startupError = isAddressInUseError(err)
+      ? createPortInUseStartupError(err, { host, port, listenHost, networkMode })
+      : isListenPermissionError(err)
+      ? createListenPermissionStartupError(err, { host, port, listenHost, networkMode })
+      : err;
+    if (startupError.startupPayload) {
+      log.error(`startup-error ${JSON.stringify(startupError.startupPayload)}`);
+    }
+    log.error(`启动失败: ${startupError.message}`);
+    process.exit(1);
+  }
+}
+
+function isAddressInUseError(err) {
+  return err?.code === "EADDRINUSE";
+}
+
+function isListenPermissionError(err) {
+  return err?.code === "EACCES";
+}
+
+function createPortInUseStartupError(cause, { host, port, listenHost, networkMode }) {
+  const payload = {
+    code: "PORT_IN_USE",
+    host,
+    port,
+    listenHost,
+    networkMode,
+    suggestions: [
+      `Close the process already listening on ${host}:${port}.`,
+      "If this is another Hana server, restart that instance or quit it cleanly.",
+      "To use a different port, change the port in Access & Devices and restart.",
+    ],
+  };
+  const err = new Error(
+    `PORT_IN_USE: ${host}:${port} is already in use (network mode: ${networkMode}, configured host: ${listenHost}).`
+  );
+  err.code = "PORT_IN_USE";
+  err.startupPayload = payload;
+  err.cause = cause;
+  return err;
+}
+
+function createListenPermissionStartupError(cause, { host, port, listenHost, networkMode }) {
+  const payload = {
+    code: "LISTEN_PERMISSION_DENIED",
+    host,
+    port,
+    listenHost,
+    networkMode,
+    suggestions: [
+      `Check whether Windows reserved port policy or security software blocks listening on ${host}:${port}.`,
+      "Use loopback mode for local-only access, or enable LAN from Access & Devices and restart.",
+      "To use a different port, change the port in Access & Devices and restart.",
+    ],
+  };
+  const err = new Error(
+    `LISTEN_PERMISSION_DENIED: ${host}:${port} cannot be listened on (network mode: ${networkMode}, configured host: ${listenHost}).`
+  );
+  err.code = "LISTEN_PERMISSION_DENIED";
+  err.startupPayload = payload;
+  err.cause = cause;
+  return err;
+}
 
 // 用户数据存放在 ~/.hanako/（打包后与产品代码分离）
 // 开发时可通过 HANA_HOME 环境变量隔离数据目录，如：HANA_HOME=~/.hanako-dev node server/index.js
@@ -83,13 +175,6 @@ const hanakoHome = resolveHanakoHome(process.env.HANA_HOME);
 process.env.HANA_HOME = hanakoHome;
 ensureHanaPiSdkDirs(hanakoHome);
 configureProcessPiSdkEnv(hanakoHome);
-// ── 首次运行播种 ──
-console.log("[server] ① ensureFirstRun...");
-ensureFirstRun(hanakoHome, productDir);
-console.log("[server] ① ensureFirstRun 完成");
-
-// ── 初始化 Debug 日志 ──
-const dlog = initDebugLog(path.join(hanakoHome, "logs"));
 
 // 读取版本号
 let appVersion = "?";
@@ -98,12 +183,61 @@ try {
   appVersion = pkg.version || "?";
 } catch {}
 
+const SERVER_TOKEN = process.env.HANA_TOKEN || crypto.randomBytes(16).toString("hex");
+const serverNetwork = resolveServerListenOptions(hanakoHome);
+const envPort = Number.parseInt(process.env.HANA_PORT || "", 10);
+const port = Number.isInteger(envPort) && envPort >= 0 ? envPort : serverNetwork.port;
+const serverRuntimeState = {
+  mode: serverNetwork.mode,
+  listenHost: serverNetwork.host,
+  bindHost: serverNetwork.host,
+  actualPort: null,
+  applyNetworkConfig(network) {
+    this.configuredMode = network.mode;
+    this.configuredListenHost = network.listenHost;
+  },
+};
+const host = serverRuntimeState.bindHost;
+
+let activeFetch = (request) => {
+  const url = new URL(request.url);
+  if (url.pathname === "/api/health") {
+    return Response.json({
+      status: "starting",
+      version: appVersion,
+      networkMode: serverRuntimeState.mode,
+      configuredHost: serverRuntimeState.listenHost,
+    }, { status: 503 });
+  }
+  return Response.json({ error: "server_starting" }, { status: 503 });
+};
+
+let server = createAdaptorServer({
+  fetch: (...args) => activeFetch(...args),
+  hostname: host,
+});
+
+await bindServerTransportOwnership(server, {
+  host,
+  port,
+  listenHost: serverNetwork.host,
+  networkMode: serverNetwork.mode,
+});
+
+// ── 首次运行播种 ──
+log.log("① ensureFirstRun...");
+ensureFirstRun(hanakoHome, productDir);
+log.log("① ensureFirstRun 完成");
+
+// ── 初始化 Debug 日志 ──
+const dlog = initDebugLog(path.join(hanakoHome, "logs"));
+
 // ── 初始化引擎 ──
-console.log("[server] ② 创建 HanaEngine...");
+log.log("② 创建 HanaEngine...");
 const engine = new HanaEngine({ hanakoHome, productDir, appVersion });
-console.log("[server] ② HanaEngine 构造完成，开始 init...");
-await engine.init((msg) => console.log(`[server] ${msg}`));
-console.log("[server] ② engine.init 完成");
+log.log("② HanaEngine 构造完成，开始 init...");
+await engine.init((msg) => log.log(msg));
+log.log("② engine.init 完成");
 dlog.log("server", "engine initialized");
 
 const outboundProxyRuntime = createOutboundProxyRuntime({
@@ -131,6 +265,8 @@ dlog.header(appVersion, {
   channelsDir: engine.channelsDir,
 });
 
+if (process.platform === "win32") engine.startWin32LegacySandboxMaintenance();
+
 // ── 初始化 Hub（调度中枢，包装 engine） ──
 const hub = new Hub({ engine });
 
@@ -141,15 +277,15 @@ await engine.initPlugins(hub.eventBus);
 hub.initSchedulers();
 
 engine.cleanupCheckpoints().catch(err => {
-  console.warn("[checkpoint] startup cleanup failed:", err.message);
+  checkpointLog.warn(`startup cleanup failed: ${err.message}`);
 });
 
 engine.cleanupColdSessionFiles().catch(err => {
-  console.warn("[session-files] startup cleanup failed:", err.message);
+  sessionFilesLog.warn(`startup cleanup failed: ${err.message}`);
 });
 const sessionFileCleanupTimer = setInterval(() => {
   engine.cleanupColdSessionFiles().catch(err => {
-    console.warn("[session-files] periodic cleanup failed:", err.message);
+    sessionFilesLog.warn(`periodic cleanup failed: ${err.message}`);
   });
 }, 24 * 60 * 60 * 1000);
 sessionFileCleanupTimer.unref?.();
@@ -157,24 +293,11 @@ sessionFileCleanupTimer.unref?.();
 // 加载 i18n（engine.init 已经按全局偏好加载过，这里保持启动入口显式同步）
 loadLocale(engine.getLocale?.() || engine.config?.locale);
 
-// ── 启动令牌（阻止本机其他程序随意访问） ──
-const SERVER_TOKEN = process.env.HANA_TOKEN || crypto.randomBytes(16).toString("hex");
 const serverAuthService = createServerAuthService({
   hanakoHome,
   loopbackToken: SERVER_TOKEN,
   runtimeContext: () => engine.getRuntimeContext(),
 });
-const serverNetwork = resolveServerListenOptions(hanakoHome);
-const serverRuntimeState = {
-  mode: serverNetwork.mode,
-  listenHost: serverNetwork.host,
-  bindHost: "0.0.0.0",
-  actualPort: null,
-  applyNetworkConfig(network) {
-    this.mode = network.mode;
-    this.listenHost = network.listenHost;
-  },
-};
 
 // ── 创建 Hono 实例 ──
 const app = new Hono();
@@ -279,6 +402,11 @@ hub.eventBus.handle("deferred:register", ({ taskId, sessionPath, meta }) => {
   deferredResultStore.defer(taskId, sessionPath, meta);
   return { ok: true, sessionPath };
 });
+hub.eventBus.handle("deferred:retry", ({ taskId, sessionPath, meta }) => {
+  if (!sessionPath) return { ok: false, error: "sessionPath is required" };
+  deferredResultStore.retry(taskId, sessionPath, meta);
+  return { ok: true, sessionPath };
+});
 hub.eventBus.handle("deferred:resolve", ({ taskId, result, files, sessionFiles }) => {
   deferredResultStore.resolve(taskId, normalizeDeferredResolveResult({ result, files, sessionFiles }));
   return { ok: true };
@@ -352,11 +480,83 @@ hub.eventBus.handle("session:get-titles", async ({ paths }) => {
   const titles = await coord.getTitlesForPaths(paths);
   return { titles };
 });
+hub.eventBus.handle("utility:call-text", async (payload = {}) => {
+  const sessionPath = typeof payload.sessionPath === "string" && payload.sessionPath.trim()
+    ? payload.sessionPath.trim()
+    : null;
+  const agentId = typeof payload.agentId === "string" && payload.agentId.trim()
+    ? payload.agentId.trim()
+    : (sessionPath ? engine.agentIdFromSessionPath?.(sessionPath) || null : null);
+  const utility = engine.resolveUtilityConfig({ agentId, sessionPath });
+  const text = await callText({
+    api: utility.api,
+    apiKey: utility.api_key,
+    baseUrl: utility.base_url,
+    model: utility.utility,
+    systemPrompt: payload.systemPrompt || "",
+    messages: Array.isArray(payload.messages) ? payload.messages : [],
+    temperature: payload.temperature,
+    maxTokens: payload.maxTokens,
+    usageLedger: utility.usageLedger,
+    usageContext: {
+      source: {
+        subsystem: "utility",
+        operation: payload.operation || "call-text",
+        surface: sessionPath ? "desktop" : "system",
+        trigger: "tool",
+      },
+      attribution: sessionPath
+        ? { kind: "session", agentId: utility.usageAgentId || agentId || null, sessionPath }
+        : { kind: "utility", agentId: utility.usageAgentId || agentId || null },
+    },
+  });
+  return { text };
+});
+hub.eventBus.handle("usage:list", (filter = {}) => {
+  return engine.usageLedger.list(filter);
+});
 
 // Register Pi SDK extension factory
 await engine.registerExtensionFactory(createDeferredResultExtension(deferredResultStore));
-// Compaction guard — 防 session 因上下文超限死锁（issue#437）
-await engine.registerExtensionFactory(createCompactionGuardExtension());
+// Cache-preserving compaction — 接管 Pi auto/manual compact，避免原生 summarizer 冷读上下文
+await engine.registerExtensionFactory(createCompactionGuardExtension({
+  usageLedger: engine.usageLedger,
+  buildUsageContext: ({ ctx }) => {
+    const sessionPath = ctx?.sessionManager?.getSessionFile?.() || null;
+    const bridgeContext = sessionPath ? engine.getBridgeContextForSessionPath(sessionPath) : null;
+    if (bridgeContext?.isBridgeSession) {
+      const conversationType = bridgeContext.chatType === "channel" ? "channel" : "dm";
+      return {
+        source: {
+          subsystem: "compaction",
+          operation: "fresh_compact",
+          surface: conversationType,
+          trigger: "threshold",
+        },
+        attribution: {
+          kind: "phone_conversation",
+          agentId: bridgeContext.agentId || null,
+          conversationId: bridgeContext.sessionKey || bridgeContext.chatId || sessionPath,
+          conversationType,
+          sessionPath,
+        },
+      };
+    }
+    return {
+      source: {
+        subsystem: "compaction",
+        operation: "compact",
+        surface: "desktop",
+        trigger: "threshold",
+      },
+      attribution: {
+        kind: "session",
+        agentId: sessionPath ? engine.agentIdFromSessionPath?.(sessionPath) || null : null,
+        sessionPath,
+      },
+    };
+  },
+}));
 
 // ── 启动默认 session ──
 // Desktop 会显式跳过：renderer 首屏就是 pending-new-session，首次发送消息时
@@ -366,12 +566,12 @@ await engine.registerExtensionFactory(createCompactionGuardExtension());
 // startup session 上（Codex 评审发现的 issue#437 部分失效场景）。
 const shouldCreateStartupSession = process.env.HANA_CREATE_STARTUP_SESSION !== "0";
 if (shouldCreateStartupSession && engine.currentModel) {
-  console.log("[server] ③ 创建 session...");
+  log.log("③ 创建 session...");
   await engine.createSession();
-  console.log("[server] ③ Session created");
+  log.log("③ Session created");
   dlog.log("server", `session created, model=${engine.currentModel.name}`);
 } else if (!shouldCreateStartupSession) {
-  console.log("[server] ③ 跳过启动期 session 创建");
+  log.log("③ 跳过启动期 session 创建");
   dlog.log("server", "startup session creation skipped");
 } else {
   // 诊断信息：区分三种 currentModel=null 的情况，方便用户排查 (#414)
@@ -386,7 +586,7 @@ if (shouldCreateStartupSession && engine.currentModel) {
   } else {
     reason = `models.chat=${chatRefStr} not found in ${availableCount} available models`;
   }
-  console.warn(`[server] ⚠ 无可用模型，跳过 session 创建：${reason}`);
+  log.warn(`⚠ 无可用模型，跳过 session 创建：${reason}`);
   dlog.warn("server", `session creation skipped: ${reason}`);
 }
 
@@ -414,18 +614,18 @@ async function startBridgeManager({ autoStart = false } = {}) {
 
   bridgeManagerInitError = null;
   bridgeManagerInitPromise = (async () => {
-    console.log("[server] Bridge manager 初始化...");
+    log.log("Bridge manager 初始化...");
     const { BridgeManager } = await import("../lib/bridge/bridge-manager.js");
     const manager = new BridgeManager({ engine, hub });
     bridgeManager = manager;
     hub.bridgeManager = manager;
     if (bridgeAutoStartRequested) runBridgeAutoStart(manager);
-    console.log("[server] Bridge manager 初始化完成");
+    log.log("Bridge manager 初始化完成");
     return manager;
   })().catch((err) => {
     bridgeManagerInitError = err;
     hub.bridgeManager = null;
-    console.error("[server] Bridge manager 初始化失败:", err.message);
+    log.error(`Bridge manager 初始化失败: ${err.message}`);
     dlog.error("server", `bridge init failed: ${err.stack || err.message}`);
     return null;
   }).finally(() => {
@@ -447,6 +647,7 @@ const bridgeManagerRef = {
 
 const { restRoute: chatRestRoute, wsRoute: chatWsRoute } = createChatRoute(engine, hub, { upgradeWebSocket });
 app.route("", createMobileStaticRoute({ distDir: fromRoot("desktop", "dist-renderer") }));
+app.route("", createHtmlPreviewRoute());
 app.route("/api", chatRestRoute);
 app.route("", chatWsRoute);
 app.route("/api", createWebAuthRoute({
@@ -472,7 +673,7 @@ app.route("/api", createDeskRoute(engine, hub));
 app.route("/api", createMobileWorkbenchRoute(engine));
 app.route("/api", createSkillsRoute(engine));
 app.route("/api", createChannelsRoute(engine, hub));
-app.route("/api", createDmRoute(engine));
+app.route("/api", createDmRoute(engine, hub));
 app.route("/api", createFsRoute(engine));
 app.route("/api", createPreferencesRoute(engine));
 app.route("/api", createBridgeRoute(engine, bridgeManagerRef));
@@ -483,6 +684,7 @@ app.route("/api", createPluginsRoute(engine));
 app.route("/api", createCheckpointsRoute(engine));
 app.route("/api", createCommandsRoute(engine));
 app.route("/api", createResourcesRoute(engine));
+app.route("/api", createUsageRoute(engine));
 app.route("/api", createServerIdentityRoute({
   hanakoHome: engine.hanakoHome,
   appVersion,
@@ -513,6 +715,8 @@ app.get("/api/health", async (c) => {
     avatars,
   });
 });
+
+activeFetch = app.fetch.bind(app);
 
 // 前端日志上报（desktop 端把错误 POST 到 server 写进持久化日志）
 app.post("/api/log", async (c) => {
@@ -605,44 +809,14 @@ app.post("/api/session-permission-mode", async (c) => {
 
 // 远程关闭（供 desktop 端复用 server 退出时调用，跨平台可靠的 graceful shutdown）
 app.post("/api/shutdown", async (c) => {
-  console.log("[server] 收到 HTTP shutdown 请求，正在清理...");
+  log.log("收到 HTTP shutdown 请求，正在清理...");
   // 异步执行，先返回响应
   setTimeout(() => gracefulShutdown(), 100);
   return c.json({ ok: true });
 });
 
-// ── 启动服务器 ──
-const envPort = Number.parseInt(process.env.HANA_PORT || "", 10);
-const port = Number.isInteger(envPort) && envPort >= 0 ? envPort : serverNetwork.port;
-const host = serverRuntimeState.bindHost;
-
-let server;
+// ── 发布已绑定服务器 ──
 try {
-  server = serve({ fetch: app.fetch, port, hostname: host });
-
-  // @hono/node-server 的 serve() 内部调用 server.listen()，
-  // port=0 时需等 listening 事件才能拿到实际端口
-  await new Promise((resolve, reject) => {
-    if (server.listening) {
-      resolve();
-      return;
-    }
-    const cleanup = () => {
-      server.off("listening", onListening);
-      server.off("error", onError);
-    };
-    const onListening = () => {
-      cleanup();
-      resolve();
-    };
-    const onError = (err) => {
-      cleanup();
-      reject(err);
-    };
-    server.once("listening", onListening);
-    server.once("error", onError);
-  });
-
   // ── Internal browser control WS (raw ws) ──
   // WsTransport requires raw ws .on()/.off() event methods that Hono's WSContext
   // doesn't expose, so we handle /internal/browser via a standalone WebSocketServer.
@@ -720,13 +894,13 @@ try {
 
     ws.on("close", () => {
       if (bm._transport?._ws === ws) bm.setWsTransport(null);
-      console.log("[server] Electron browser control WS disconnected");
+      log.log("Electron browser control WS disconnected");
     });
     ws.on("error", (err) => {
-      console.error("[server] Electron browser control WS error:", err.message);
+      log.error(`Electron browser control WS error: ${err.message}`);
       if (bm._transport?._ws === ws) bm.setWsTransport(null);
     });
-    console.log("[server] Electron browser control WS connected");
+    log.log("Electron browser control WS connected");
   });
 
   // Inject Hono WS for chat and other WS routes, but skip /internal/browser
@@ -749,7 +923,7 @@ try {
   const actualPort = address.port;
   serverRuntimeState.actualPort = actualPort;
 
-  console.log(`[server] Hanako Server 运行在 http://${host}:${actualPort}`);
+  log.log(`HanaAgent Server 运行在 http://${host}:${actualPort}`);
   dlog.log("server", `listening on :${actualPort}`);
 
   // 写 server-info 文件，供 Electron 检测复用或外部工具查询。
@@ -758,6 +932,7 @@ try {
   // 非授权进程能读到 token 后冒充 owner 调任意 LOCAL_ONLY 路由。
   const serverInfoPath = path.join(hanakoHome, "server-info.json");
   try {
+    const runtimeContext = engine.getRuntimeContext?.() || {};
     fs.writeFileSync(serverInfoPath, JSON.stringify({
       pid: process.pid,
       port: actualPort,
@@ -766,15 +941,21 @@ try {
       networkMode: serverRuntimeState.mode,
       token: SERVER_TOKEN,
       version: appVersion,
+      ownerKind: process.env.HANA_SERVER_OWNER === "desktop" ? "desktop" : "standalone",
+      ownerPid: Number.parseInt(process.env.HANA_SERVER_OWNER_PID || "", 10) || null,
+      serverId: runtimeContext.serverId || null,
+      serverNodeId: runtimeContext.serverNodeId || runtimeContext.serverId || null,
+      studioId: runtimeContext.studioId || null,
+      userId: runtimeContext.userId || null,
     }), { mode: 0o600 });
     // mode-on-create 在某些 fs 上不可靠（已有文件不会重置 mode），显式 chmod 兜底
     try { fs.chmodSync(serverInfoPath, 0o600); } catch {}
   } catch (e) {
-    console.error("[server] 写入 server-info.json 失败:", e.message);
+    log.error(`写入 server-info.json 失败: ${e.message}`);
   }
 
   // 通知就绪（server-info.json 已在上方写入，无需额外动作）
-  console.log(`[server] ready: port=${actualPort}`);
+  log.log(`ready: port=${actualPort}`);
 
   // Bridge 平台依赖不属于 HTTP readiness 的前置条件。先让桌面端拿到
   // server-info，再在后台加载外部平台 adapter，避免 Windows 上依赖加载
@@ -792,7 +973,7 @@ try {
   }
 
 } catch (err) {
-  console.error("[server] 启动失败:", err.message);
+  log.error(`启动失败: ${err.message}`);
   process.exit(1);
 }
 
@@ -801,12 +982,12 @@ let _shutting = false;
 async function gracefulShutdown() {
   if (_shutting) return;
   _shutting = true;
-  console.log("\n[server] 正在关闭...");
+  log.log("\n正在关闭...");
   dlog.log("server", "shutting down...");
 
   // 超时保护：15 秒内必须完成（含 memory final pass LLM 调用），否则强制退出
   const forceTimer = setTimeout(() => {
-    console.error("[server] 关闭超时，强制退出");
+    log.error("关闭超时，强制退出");
     process.exit(1);
   }, 15000);
   forceTimer.unref();
@@ -814,7 +995,7 @@ async function gracefulShutdown() {
   try {
     // 1. 先停止接受新请求
     server.close();
-    console.log("[server] HTTP server 已关闭");
+    log.log("HTTP server 已关闭");
     dlog.log("server", "HTTP server closed");
 
     // 2. 挂起浏览器（保留冷保存，重启后可恢复卡片）
@@ -823,10 +1004,10 @@ async function gracefulShutdown() {
       const bm = BrowserManager.instance();
       for (const sp of bm.runningSessions) {
         await bm.suspendForSession(sp);
-        console.log(`[server] 浏览器已挂起: ${sp}`);
+        log.log(`浏览器已挂起: ${sp}`);
       }
     } catch (e) {
-      console.error("[server] 浏览器挂起失败:", e.message);
+      log.error(`浏览器挂起失败: ${e.message}`);
     }
 
     // 3. 停止外部平台
@@ -838,10 +1019,10 @@ async function gracefulShutdown() {
 
     // 5. 清理 Hub + 引擎（停 ticker → 等 tick 完成 → 关 DB → 清理 session）
     await hub.dispose();
-    console.log("[server] Hub + Engine 已清理");
+    log.log("Hub + Engine 已清理");
     dlog.log("server", "hub + engine disposed");
   } catch (err) {
-    console.error("[server] 关闭出错:", err.message);
+    log.error(`关闭出错: ${err.message}`);
     dlog.error("server", `shutdown error: ${err.message}`);
   }
 

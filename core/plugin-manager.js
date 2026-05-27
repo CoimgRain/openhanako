@@ -5,6 +5,10 @@ import { freshImport } from "./fresh-import.js";
 import { normalizePluginConfigSchema } from "./plugin-config.js";
 import { semverGte } from "../lib/plugin-versioning.js";
 import { detectIncompatiblePluginFormat } from "../lib/plugin-format-guard.js";
+import { createModuleLogger } from "../lib/debug-log.js";
+import { getToolSessionPath, normalizeToolRuntimeContext } from "../lib/tools/tool-session.js";
+
+const log = createModuleLogger("plugin-manager");
 
 const KNOWN_CONTRIBUTION_DIRS = [
   "tools", "routes", "skills", "agents", "commands", "providers",
@@ -15,6 +19,29 @@ const KNOWN_UI_HOST_CAPABILITIES = new Set([
   "sessionFile.open",
 ]);
 const DEFAULT_PLUGIN_LOAD_TIMEOUT_MS = 15_000;
+const PLUGIN_SOURCE_PRIORITY = Object.freeze({
+  dev: 0,
+  community: 1,
+  builtin: 2,
+});
+
+function normalizePluginSource(source) {
+  if (source === "builtin" || source === "dev" || source === "community") return source;
+  return "community";
+}
+
+function createPluginKey(source, pluginId) {
+  return `${normalizePluginSource(source)}:${pluginId}`;
+}
+
+function pluginSourcePriority(source) {
+  return PLUGIN_SOURCE_PRIORITY[normalizePluginSource(source)] ?? 99;
+}
+
+function pluginDataDirForEntry(rootDir, entry) {
+  if (entry.source === "dev") return path.join(rootDir, "dev", entry.id);
+  return path.join(rootDir, entry.id);
+}
 
 class PluginLoadTimeoutError extends Error {
   constructor(pluginId, stage, ms) {
@@ -34,7 +61,7 @@ function normalizeUiHostCapabilities(raw, pluginId) {
     if (typeof item !== "string" || item.trim() === "") continue;
     const capability = item.trim();
     if (!KNOWN_UI_HOST_CAPABILITIES.has(capability)) {
-      console.warn(`[plugin-manager] plugin "${pluginId}" declares unknown UI host capability "${capability}", ignoring`);
+      log.warn(`plugin "${pluginId}" declares unknown UI host capability "${capability}", ignoring`);
       continue;
     }
     if (seen.has(capability)) continue;
@@ -58,6 +85,26 @@ function activationMatches(events = [], reason = {}) {
   if (event.startsWith("onToolCall:") && events.includes("onToolCall")) return true;
   if (event.startsWith("onBusRequest:") && events.includes("onBusRequest")) return true;
   return false;
+}
+
+function normalizePluginToolResult(raw, pluginId) {
+  let result;
+  if (typeof raw === "string") {
+    result = { content: [{ type: "text", text: raw }] };
+  } else if (raw && raw.content) {
+    result = raw;
+  } else {
+    result = { content: [{ type: "text", text: String(raw ?? "") }] };
+  }
+  if (result.details?.card && pluginId && !result.details.card.pluginId) {
+    result.details.card.pluginId = pluginId;
+  }
+  return result;
+}
+
+function getDynamicToolInvocationStyle(toolDef = {}) {
+  const style = toolDef.invocationStyle || toolDef.metadata?.hanaInvocationStyle;
+  return style === "pi_tool" ? "pi_tool" : "sdk_tool";
 }
 
 export class PluginManager {
@@ -94,6 +141,7 @@ export class PluginManager {
     this._scanned = [];
     this._opQueue = Promise.resolve();
     this.routeRegistry = new Map();
+    this._routeApps = new Map();
 
     // Contribution registries
     this._tools = [];
@@ -116,6 +164,99 @@ export class PluginManager {
       : DEFAULT_PLUGIN_LOAD_TIMEOUT_MS;
   }
 
+  _entryFromDescriptor(desc, overrides = {}) {
+    const source = normalizePluginSource(overrides.source || desc.source);
+    const entry = {
+      ...desc,
+      ...overrides,
+      source,
+      pluginKey: createPluginKey(source, desc.id),
+    };
+    return entry;
+  }
+
+  _setPluginEntry(entry) {
+    entry.source = normalizePluginSource(entry.source);
+    entry.pluginKey = entry.pluginKey || createPluginKey(entry.source, entry.id);
+    this._plugins.set(entry.pluginKey, entry);
+    return entry;
+  }
+
+  _entriesForId(pluginId) {
+    return [...this._plugins.values()].filter((entry) => entry.id === pluginId);
+  }
+
+  findPluginEntry({ id, source, pluginKey, pluginDir } = {}) {
+    if (pluginKey && this._plugins.has(pluginKey)) return this._plugins.get(pluginKey);
+    const normalizedSource = source ? normalizePluginSource(source) : null;
+    if (id && normalizedSource) return this._plugins.get(createPluginKey(normalizedSource, id)) || null;
+    const entries = [...this._plugins.values()];
+    return entries.find((entry) => (
+      (!id || entry.id === id)
+      && (!normalizedSource || entry.source === normalizedSource)
+      && (!pluginDir || (entry.pluginDir && path.resolve(entry.pluginDir) === path.resolve(pluginDir)))
+    )) || null;
+  }
+
+  _resolvePluginEntry(pluginId, options = {}) {
+    if (!pluginId) return null;
+    if (options.pluginKey) return this.findPluginEntry({ pluginKey: options.pluginKey });
+    if (options.source) return this.findPluginEntry({ id: pluginId, source: options.source });
+    if (this._plugins.has(pluginId)) return this._plugins.get(pluginId);
+    return this._getRuntimeEntryForId(pluginId) || this._getPreferredEntryForId(pluginId);
+  }
+
+  _getPreferredEntryForId(pluginId) {
+    const entries = this._entriesForId(pluginId);
+    return entries.sort((a, b) => pluginSourcePriority(a.source) - pluginSourcePriority(b.source))[0] || null;
+  }
+
+  _getRuntimeEntryForId(pluginId) {
+    const entries = this._entriesForId(pluginId)
+      .filter((entry) => entry.status === "loaded")
+      .sort((a, b) => pluginSourcePriority(a.source) - pluginSourcePriority(b.source));
+    return entries[0] || null;
+  }
+
+  _isPluginKeyRuntimeActive(pluginKey) {
+    const entry = this._plugins.get(pluginKey);
+    if (!entry || entry.status !== "loaded") return false;
+    return this._getRuntimeEntryForId(entry.id)?.pluginKey === pluginKey;
+  }
+
+  _refreshRouteRegistryForId(pluginId) {
+    this.routeRegistry.delete(pluginId);
+    const activeEntry = this._getRuntimeEntryForId(pluginId);
+    if (!activeEntry) return;
+    const routeRecord = this._routeApps.get(activeEntry.pluginKey);
+    if (routeRecord?.app) this.routeRegistry.set(pluginId, routeRecord.app);
+  }
+
+  _annotateShadowing() {
+    for (const entry of this._plugins.values()) {
+      entry.shadowedBy = null;
+      entry.shadowedByPluginKey = null;
+      entry.shadows = [];
+    }
+    const byId = new Map();
+    for (const entry of this._plugins.values()) {
+      if (!byId.has(entry.id)) byId.set(entry.id, []);
+      byId.get(entry.id).push(entry);
+    }
+    for (const entries of byId.values()) {
+      const loaded = entries
+        .filter((entry) => entry.status === "loaded")
+        .sort((a, b) => pluginSourcePriority(a.source) - pluginSourcePriority(b.source));
+      const active = loaded[0] || null;
+      if (!active) continue;
+      active.shadows = loaded.slice(1).map((entry) => entry.pluginKey);
+      for (const entry of loaded.slice(1)) {
+        entry.shadowedBy = active.source;
+        entry.shadowedByPluginKey = active.pluginKey;
+      }
+    }
+  }
+
   scan() {
     const results = [];
     const seen = new Set();
@@ -125,20 +266,23 @@ export class PluginManager {
       if (!fs.existsSync(dir)) continue;
       for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
         if (!entry.isDirectory() || entry.name.startsWith(".")) continue;
-        if (seen.has(entry.name)) continue;
-        seen.add(entry.name);
+        const dirKey = `${source}:${entry.name}`;
+        if (seen.has(dirKey)) continue;
+        seen.add(dirKey);
         const pluginDir = path.join(dir, entry.name);
         try {
           const desc = this._readPluginDescriptor(pluginDir, entry.name);
           desc.source = source;
-          if (seen.has(`id:${desc.id}`)) {
-            console.warn(`[plugin-manager] plugin id "${desc.id}" 冲突（目录 "${entry.name}"），跳过`);
+          desc.pluginKey = createPluginKey(source, desc.id);
+          const idKey = `${source}:id:${desc.id}`;
+          if (seen.has(idKey)) {
+            log.warn(`plugin id "${desc.id}" 冲突（source "${source}", 目录 "${entry.name}"），跳过`);
             continue;
           }
-          seen.add(`id:${desc.id}`);
+          seen.add(idKey);
           results.push(desc);
         } catch (err) {
-          console.error(`[plugin-manager] failed to read plugin "${entry.name}":`, err.message);
+          log.error(`failed to read plugin "${entry.name}": ${err.message}`);
         }
       }
     }
@@ -178,20 +322,20 @@ export class PluginManager {
     const descriptors = this._scanned.length > 0 ? this._scanned : this.scan();
     const disabledList = this._preferencesManager?.getDisabledPlugins() || [];
     for (const desc of descriptors) {
-      const entry = { ...desc, status: "loading", activationState: "inactive", activationReason: null, instance: null, _disposables: [] };
+      const entry = this._entryFromDescriptor(desc, { status: "loading", activationState: "inactive", activationReason: null, instance: null, _disposables: [] });
 
       // builtin 插件不受 disabled 列表和全权开关约束，始终加载
-      if (desc.source !== "builtin" && disabledList.includes(desc.id)) {
+      if (entry.source === "community" && disabledList.includes(entry.id)) {
         entry.status = "disabled";
-        this._plugins.set(desc.id, entry);
+        this._setPluginEntry(entry);
         continue;
       }
 
       if (desc.formatIssue) {
         entry.status = "incompatible";
         entry.error = desc.formatIssue.message;
-        this._plugins.set(desc.id, entry);
-        console.warn(`[plugin-manager] "${desc.id}" skipped: ${entry.error}`);
+        this._setPluginEntry(entry);
+        log.warn(`"${desc.id}" skipped: ${entry.error}`);
         continue;
       }
 
@@ -199,7 +343,7 @@ export class PluginManager {
         const allowed = this._preferencesManager?.getAllowFullAccessPlugins() || false;
         if (!allowed) {
           entry.status = "restricted";
-          this._plugins.set(desc.id, entry);
+          this._setPluginEntry(entry);
           continue;
         }
       }
@@ -209,20 +353,22 @@ export class PluginManager {
       if (minVer && !semverGte(this._appVersion, minVer)) {
         entry.status = "incompatible";
         entry.error = `requires app v${minVer}+, current v${this._appVersion}`;
-        this._plugins.set(desc.id, entry);
-        console.warn(`[plugin-manager] "${desc.id}" skipped: ${entry.error}`);
+        this._setPluginEntry(entry);
+        log.warn(`"${desc.id}" skipped: ${entry.error}`);
         continue;
       }
 
-      this._plugins.set(desc.id, entry);
+      this._setPluginEntry(entry);
       try {
         await this._loadPluginWithBoundary(entry);
         entry.status = "loaded";
         entry.error = null;
+        this._refreshRouteRegistryForId(entry.id);
       } catch (err) {
         entry.status = "failed";
         entry.error = err.message;
-        console.error(`[plugin-manager] plugin "${desc.id}" failed to load:`, err.message);
+        this._refreshRouteRegistryForId(entry.id);
+        log.error(`plugin "${desc.id}" failed to load: ${err.message}`);
       }
     }
   }
@@ -233,7 +379,7 @@ export class PluginManager {
     entry._loadCancelled = false;
     entry.error = null;
     const start = Date.now();
-    console.log(`[plugin-manager] loading plugin "${entry.id}"...`);
+    log.log(`loading plugin "${entry.id}"...`);
 
     try {
       await this._withLoadTimeout(
@@ -244,7 +390,7 @@ export class PluginManager {
       if (entry._loadToken !== loadToken || entry._loadCancelled) {
         throw new Error(`Plugin "${entry.id}" load was cancelled`);
       }
-      console.log(`[plugin-manager] plugin "${entry.id}" loaded (${Date.now() - start}ms)`);
+      log.log(`plugin "${entry.id}" loaded (${Date.now() - start}ms)`);
     } catch (err) {
       entry._loadCancelled = true;
       await this._cleanupPluginEntry(entry);
@@ -273,13 +419,13 @@ export class PluginManager {
   async _runLoadStage(entry, stage, fn) {
     const start = Date.now();
     entry._loadStage = stage;
-    console.log(`[plugin-manager] loading "${entry.id}" ${stage}...`);
+    log.log(`loading "${entry.id}" ${stage}...`);
     try {
       const result = await fn();
-      console.log(`[plugin-manager] loaded "${entry.id}" ${stage} (${Date.now() - start}ms)`);
+      log.log(`loaded "${entry.id}" ${stage} (${Date.now() - start}ms)`);
       return result;
     } catch (err) {
-      console.error(`[plugin-manager] "${entry.id}" ${stage} failed:`, err?.message || err);
+      log.error(`"${entry.id}" ${stage} failed: ${err?.message || err}`);
       throw err;
     }
   }
@@ -307,14 +453,17 @@ export class PluginManager {
 
     entry.ctx = createPluginContext({
       pluginId: entry.id,
+      pluginKey: entry.pluginKey,
+      source: entry.source,
       pluginDir: entry.pluginDir,
-      dataDir: path.join(this._dataDir, entry.id),
+      dataDir: pluginDataDirForEntry(this._dataDir, entry),
       bus: this._bus,
       accessLevel,
       registerSessionFile: this._registerSessionFile,
       configSchema: entry.configSchema,
       logSink: this._logSink,
       runtimeContext: this._runtimeContext,
+      permissions: entry.manifest?.permissions,
     });
 
     // All plugins: declarative contributions
@@ -370,17 +519,17 @@ export class PluginManager {
             if (typeof disposable !== "function") return;
             if (entry._loadToken !== loadToken || entry._loadCancelled) {
               try { disposable(); } catch (err) {
-                console.error(`[plugin-manager] "${entry.id}" late disposable error:`, err.message);
+                log.error(`"${entry.id}" late disposable error: ${err.message}`);
               }
               return;
             }
             entry._disposables.push(disposable);
           };
           instance.ctx.registerTool = (toolDef) => {
-            const dispose = this.addTool(entry.id, toolDef);
+            const dispose = this.addTool(entry.id, toolDef, { pluginKey: entry.pluginKey, source: entry.source });
             if (entry._loadToken !== loadToken || entry._loadCancelled) {
               try { dispose(); } catch (err) {
-                console.error(`[plugin-manager] "${entry.id}" late dynamic tool cleanup error:`, err.message);
+                log.error(`"${entry.id}" late dynamic tool cleanup error: ${err.message}`);
               }
               return () => {};
             }
@@ -407,20 +556,20 @@ export class PluginManager {
     return entry._activationPromise;
   }
 
-  async activatePlugin(pluginId, reason = {}) {
-    const entry = this._plugins.get(pluginId);
+  async activatePlugin(pluginId, reason = {}, options = {}) {
+    const entry = this._resolvePluginEntry(pluginId, options);
     if (!entry) throw new Error(`Plugin "${pluginId}" not found`);
     if (!activationMatches(entry.activationEvents, reason)) return entry;
     return this._activatePluginEntry(entry, reason);
   }
 
   async activatePluginRoute(pluginId, routePath) {
-    const entry = this._plugins.get(pluginId);
+    const entry = this._getRuntimeEntryForId(pluginId);
     if (!entry) return null;
-    const page = this._pages.find((item) => item.pluginId === pluginId && item.route === routePath);
-    const widget = this._widgets.find((item) => item.pluginId === pluginId && item.route === routePath);
-    if (page) return this.activatePlugin(pluginId, { event: "onPageOpen", route: routePath });
-    if (widget) return this.activatePlugin(pluginId, { event: "onWidgetOpen", route: routePath });
+    const page = this._pages.find((item) => item.pluginKey === entry.pluginKey && item.route === routePath);
+    const widget = this._widgets.find((item) => item.pluginKey === entry.pluginKey && item.route === routePath);
+    if (page) return this.activatePlugin(pluginId, { event: "onPageOpen", route: routePath }, { pluginKey: entry.pluginKey });
+    if (widget) return this.activatePlugin(pluginId, { event: "onWidgetOpen", route: routePath }, { pluginKey: entry.pluginKey });
     return entry;
   }
 
@@ -443,36 +592,27 @@ export class PluginManager {
           parameters: mod.parameters ?? {},
           ...(mod.promptSnippet ? { promptSnippet: mod.promptSnippet } : {}),
           ...(mod.promptGuidelines ? { promptGuidelines: mod.promptGuidelines } : {}),
-          execute: async (_toolCallId, params, runtimeCtx) => {
-            await this.activatePlugin(entry.id, { event: `onToolCall:${mod.name}`, toolName: mod.name });
-            // 优先从 Pi SDK runtime ctx 获取 sessionPath，fallback 到焦点回调（过渡期）
-            const sessionPath = runtimeCtx?.sessionManager?.getSessionFile?.()
-              || this._getSessionPath?.();
+          ...(typeof mod.isEnabledForAgentConfig === "function" ? { isEnabledForAgentConfig: mod.isEnabledForAgentConfig } : {}),
+          execute: async (_toolCallId, params, signalOrRuntimeCtx, _onUpdate, piCtx) => {
+            await this.activatePlugin(entry.id, { event: `onToolCall:${mod.name}`, toolName: mod.name }, { pluginKey: entry.pluginKey });
+            const { ctx: runtimeCtx, hasExplicitCtx } = normalizeToolRuntimeContext(signalOrRuntimeCtx, piCtx);
+            const sessionPath = runtimeCtx?.sessionPath
+              || getToolSessionPath(runtimeCtx)
+              || (!hasExplicitCtx ? this._getSessionPath?.() : null)
+              || null;
             const sessionCtx = { sessionPath };
-            const mergedCtx = runtimeCtx
-              ? { ...ctx, ...sessionCtx, ...runtimeCtx }
+            const mergedCtx = hasExplicitCtx
+              ? { ...ctx, ...runtimeCtx, ...sessionCtx }
               : { ...ctx, ...sessionCtx };
             const raw = await origExecute(params, mergedCtx);
-            // Pi SDK 期望 { content: ContentBlock[], details? }
-            // Plugin tool 可能返回纯字符串，需要包装
-            let result;
-            if (typeof raw === "string") {
-              result = { content: [{ type: "text", text: raw }] };
-            } else if (raw && raw.content) {
-              result = raw;
-            } else {
-              result = { content: [{ type: "text", text: String(raw ?? "") }] };
-            }
-            // Plugin Card: auto-inject pluginId
-            if (result.details?.card && !result.details.card.pluginId) {
-              result.details.card.pluginId = ctx.pluginId;
-            }
-            return result;
+            return normalizePluginToolResult(raw, ctx.pluginId);
           },
           _pluginId: entry.id,
+          _pluginKey: entry.pluginKey,
+          _pluginSource: entry.source,
         });
       } catch (err) {
-        console.error(`[plugin-manager] tool "${file}" in "${entry.id}" failed to load:`, err.message);
+        log.error(`tool "${file}" in "${entry.id}" failed to load: ${err.message}`);
       }
     }
   }
@@ -481,16 +621,35 @@ export class PluginManager {
    * 动态注册工具（供 plugin 在 onload 中调用，如 MCP bridge）
    * @param {string} pluginId
    * @param {{ name: string, description: string, parameters?: object, execute: Function }} toolDef
+   * @param {{ pluginKey?: string, source?: string }} [options]
    * @returns {Function} 清理函数（调用即移除该工具）
    */
-  addTool(pluginId, toolDef) {
+  addTool(pluginId, toolDef, options = {}) {
+    const source = options.source ? normalizePluginSource(options.source) : null;
+    const pluginKey = options.pluginKey || null;
+    const invocationStyle = getDynamicToolInvocationStyle(toolDef);
+    const origExecute = toolDef.execute;
     const tool = {
       name: `${pluginId}_${toolDef.name}`,
       description: toolDef.description || "",
       parameters: toolDef.parameters || { type: "object", properties: {} },
-      execute: toolDef.execute,
+      execute: async (toolCallId, params, signalOrRuntimeCtx, onUpdate, piCtx) => {
+        const { ctx: runtimeCtx } = normalizeToolRuntimeContext(signalOrRuntimeCtx, piCtx);
+        const sessionPath = runtimeCtx?.sessionPath || getToolSessionPath(runtimeCtx) || null;
+        const mergedCtx = sessionPath ? { ...runtimeCtx, sessionPath } : runtimeCtx;
+        const raw = invocationStyle === "pi_tool"
+          ? origExecute.length >= 5
+            ? await origExecute(toolCallId, params, signalOrRuntimeCtx, onUpdate, mergedCtx)
+            : await origExecute(toolCallId, params, mergedCtx)
+          : await origExecute(params, mergedCtx);
+        return normalizePluginToolResult(raw, pluginId);
+      },
       _pluginId: pluginId,
+      _pluginKey: pluginKey,
+      ...(pluginKey ? { _pluginKey: pluginKey } : {}),
+      ...(source ? { _pluginSource: source } : {}),
       _dynamic: true,
+      _dynamicInvocationStyle: invocationStyle,
     };
     if (typeof toolDef.isEnabledForAgentConfig === "function") {
       tool.isEnabledForAgentConfig = toolDef.isEnabledForAgentConfig;
@@ -505,8 +664,32 @@ export class PluginManager {
     };
   }
 
-  getAllTools() {
-    return [...this._tools];
+  getPluginTool(pluginId, toolName, options = {}) {
+    const entry = options.entry || this._resolvePluginEntry(pluginId, options);
+    if (!entry || !toolName) return null;
+    const requestedToolName = String(toolName).trim();
+    if (!requestedToolName) return null;
+    const prefixedToolName = `${entry.id}_${requestedToolName}`;
+    return this.getAllTools({ includeShadowed: options.includeShadowed === true }).find((candidate) => (
+      candidate?._pluginKey === entry.pluginKey
+      && (candidate.name === prefixedToolName || candidate.name === requestedToolName)
+    )) || null;
+  }
+
+  async executePluginTool(tool, { toolCallId, input = {}, runtimeCtx = {} } = {}) {
+    if (!tool || typeof tool.execute !== "function") {
+      throw new Error("plugin tool is not executable");
+    }
+    const callId = toolCallId || `plugin-tool-${Date.now()}`;
+    const raw = await tool.execute(callId, input, runtimeCtx);
+    return normalizePluginToolResult(raw, tool._pluginId);
+  }
+
+  getAllTools(options = {}) {
+    const includeShadowed = options.includeShadowed === true;
+    return this._tools.filter((tool) => (
+      includeShadowed || !tool._pluginKey || this._isPluginKeyRuntimeActive(tool._pluginKey)
+    ));
   }
 
   // ── Task 6: Skill paths + Command loader ────────────────────────────────
@@ -517,12 +700,18 @@ export class PluginManager {
     this._skillPaths.push({
       dirPath: skillsDir,
       label: `plugin:${entry.id}`,
+      pluginId: entry.id,
+      pluginKey: entry.pluginKey,
+      source: entry.source,
       builtin: entry.source === "builtin",
     });
   }
 
-  getSkillPaths() {
-    return [...this._skillPaths];
+  getSkillPaths(options = {}) {
+    const includeShadowed = options.includeShadowed === true;
+    return this._skillPaths.filter((skillPath) => (
+      includeShadowed || this._isPluginKeyRuntimeActive(skillPath.pluginKey)
+    ));
   }
 
   async _loadCommands(entry) {
@@ -542,8 +731,8 @@ export class PluginManager {
         if (hasHandler) {
           // 纪律 #1：Full-access 闸门。restricted 插件不得注册 slash handler
           if (entry.accessLevel !== "full-access") {
-            console.warn(
-              `[plugin-manager] "${entry.id}/${file}" declares slash handler but plugin is restricted; skipped. ` +
+            log.warn(
+              `"${entry.id}/${file}" declares slash handler but plugin is restricted; skipped. ` +
               `Requires builtin source or manifest.trust="full-access".`
             );
             continue;
@@ -560,7 +749,7 @@ export class PluginManager {
                 handler: mod.handler,
                 usage: mod.usage,
               },
-              { source: "plugin", sourceId: entry.id },
+              { source: "plugin", sourceId: entry.pluginKey },
             );
             // registry 返回 null 表示被保留名闸门（#3）拒绝；已在 registry 内部 warn，此处不再打印
           }
@@ -571,16 +760,21 @@ export class PluginManager {
             description: mod.description ?? "",
             execute: mod.execute,
             _pluginId: entry.id,
+            _pluginKey: entry.pluginKey,
+            _pluginSource: entry.source,
           });
         }
       } catch (err) {
-        console.error(`[plugin-manager] command "${file}" in "${entry.id}" failed to load:`, err.message);
+        log.error(`command "${file}" in "${entry.id}" failed to load: ${err.message}`);
       }
     }
   }
 
-  getAllCommands() {
-    return [...this._commands];
+  getAllCommands(options = {}) {
+    const includeShadowed = options.includeShadowed === true;
+    return this._commands.filter((command) => (
+      includeShadowed || this._isPluginKeyRuntimeActive(command._pluginKey)
+    ));
   }
 
   // ── Task 7: Route loader ─────────────────────────────────────────────────
@@ -632,10 +826,16 @@ export class PluginManager {
           mod.register(app, ctx);
         }
       } catch (err) {
-        console.error(`[plugin-manager] route "${file}" in "${entry.id}" failed to load:`, err.message);
+        log.error(`route "${file}" in "${entry.id}" failed to load: ${err.message}`);
       }
     }
-    this.routeRegistry.set(entry.id, app);
+    this._routeApps.set(entry.pluginKey, {
+      pluginId: entry.id,
+      pluginKey: entry.pluginKey,
+      source: entry.source,
+      app,
+    });
+    this._refreshRouteRegistryForId(entry.id);
   }
 
   // ── Task 8: Extension loader ─────────────────────────────────────────────
@@ -654,12 +854,12 @@ export class PluginManager {
         const mod = await freshImport(filePath);
         const factory = mod.default ?? mod;
         if (typeof factory !== "function") {
-          console.warn(`[plugin-manager] extension "${file}" in "${entry.id}" does not export a function, skipped`);
+          log.warn(`extension "${file}" in "${entry.id}" does not export a function, skipped`);
           continue;
         }
-        this._extensionFactories.push({ pluginId: entry.id, factory });
+        this._extensionFactories.push({ pluginId: entry.id, pluginKey: entry.pluginKey, source: entry.source, factory });
       } catch (err) {
-        console.error(`[plugin-manager] extension "${file}" in "${entry.id}" failed to load:`, err.message);
+        log.error(`extension "${file}" in "${entry.id}" failed to load: ${err.message}`);
       }
     }
   }
@@ -669,11 +869,19 @@ export class PluginManager {
   _loadConfiguration(entry) {
     const schema = entry.configSchema;
     if (!schema || Object.keys(schema.properties || {}).length === 0) return;
-    this._configSchemas.push({ pluginId: entry.id, schema });
+    this._configSchemas.push({ pluginId: entry.id, pluginKey: entry.pluginKey, source: entry.source, schema });
   }
 
-  getConfigSchema(pluginId) {
-    return this._configSchemas.find((s) => s.pluginId === pluginId)?.schema ?? null;
+  _resolveConfigEntry(pluginId, options = {}) {
+    if (options.source || options.pluginKey) return this._resolvePluginEntry(pluginId, options);
+    return this.findPluginEntry({ id: pluginId, source: "community" })
+      || this._resolvePluginEntry(pluginId, options);
+  }
+
+  getConfigSchema(pluginId, options = {}) {
+    const entry = this._resolveConfigEntry(pluginId, options);
+    if (!entry) return null;
+    return this._configSchemas.find((s) => s.pluginKey === entry.pluginKey)?.schema ?? null;
   }
 
   getAllConfigSchemas() {
@@ -681,22 +889,26 @@ export class PluginManager {
   }
 
   getConfig(pluginId, options = {}) {
-    const entry = this._plugins.get(pluginId);
+    const entry = this._resolveConfigEntry(pluginId, options);
     if (!entry?.ctx?.config) return null;
     return {
       pluginId,
+      pluginKey: entry.pluginKey,
+      source: entry.source,
       schema: entry.ctx.config.getSchema(),
       values: entry.ctx.config.getAll({ ...options, redacted: true }),
     };
   }
 
   setConfig(pluginId, values, options = {}) {
-    const entry = this._plugins.get(pluginId);
+    const entry = this._resolveConfigEntry(pluginId, options);
     if (!entry?.ctx?.config) throw new Error(`Plugin "${pluginId}" not found`);
     const nextValues = entry.ctx.config.setMany(values, options);
     this._bus?.emit({ type: "plugin_config_changed", pluginId, scope: options.scope || "global" });
     return {
       pluginId,
+      pluginKey: entry.pluginKey,
+      source: entry.source,
       schema: entry.ctx.config.getSchema(),
       values: entry.ctx.config.getAll({ ...options, redacted: true }),
       rawValues: nextValues,
@@ -719,6 +931,8 @@ export class PluginManager {
     }
     this._pages.push({
       pluginId: entry.id,
+      pluginKey: entry.pluginKey,
+      source: entry.source,
       title: page.title || entry.id,
       icon: page.icon || null,
       route: page.route,
@@ -740,6 +954,8 @@ export class PluginManager {
     }
     this._widgets.push({
       pluginId: entry.id,
+      pluginKey: entry.pluginKey,
+      source: entry.source,
       title: widget.title || entry.id,
       icon: widget.icon || null,
       route: widget.route,
@@ -764,6 +980,8 @@ export class PluginManager {
     }
     this._settingsTabs.push({
       pluginId: entry.id,
+      pluginKey: entry.pluginKey,
+      source: entry.source,
       id: settingsTab.id || entry.id,
       title: settingsTab.title || entry.name || entry.id,
       icon: settingsTab.icon || null,
@@ -782,15 +1000,20 @@ export class PluginManager {
       try {
         const template = JSON.parse(fs.readFileSync(filePath, "utf-8"));
         template._pluginId = entry.id;
+        template._pluginKey = entry.pluginKey;
+        template._pluginSource = entry.source;
         this._agentTemplates.push(template);
       } catch (err) {
-        console.error(`[plugin-manager] agent template "${file}" in "${entry.id}" failed to load:`, err.message);
+        log.error(`agent template "${file}" in "${entry.id}" failed to load: ${err.message}`);
       }
     }
   }
 
-  getAgentTemplates() {
-    return [...this._agentTemplates];
+  getAgentTemplates(options = {}) {
+    const includeShadowed = options.includeShadowed === true;
+    return this._agentTemplates.filter((template) => (
+      includeShadowed || this._isPluginKeyRuntimeActive(template._pluginKey)
+    ));
   }
 
   async _loadProviders(entry) {
@@ -802,15 +1025,18 @@ export class PluginManager {
       try {
         const mod = await freshImport(filePath);
         if (!mod.id) continue;
-        this._providerPlugins.push({ ...mod, _pluginId: entry.id });
+        this._providerPlugins.push({ ...mod, _pluginId: entry.id, _pluginKey: entry.pluginKey, _pluginSource: entry.source });
       } catch (err) {
-        console.error(`[plugin-manager] provider "${file}" in "${entry.id}" failed to load:`, err.message);
+        log.error(`provider "${file}" in "${entry.id}" failed to load: ${err.message}`);
       }
     }
   }
 
-  getProviderPlugins() {
-    return [...this._providerPlugins];
+  getProviderPlugins(options = {}) {
+    const includeShadowed = options.includeShadowed === true;
+    return this._providerPlugins.filter((provider) => (
+      includeShadowed || this._isPluginKeyRuntimeActive(provider._pluginKey)
+    ));
   }
 
   // ── Operation queue ───────────────────────────────────────────────────────
@@ -818,7 +1044,7 @@ export class PluginManager {
   _enqueue(fn) {
     const op = this._opQueue.then(fn);
     this._opQueue = op.catch(err => {
-      console.error("[plugin-manager] op failed:", err);
+      log.error(`op failed: ${err?.stack || err}`);
     });
     return op; // caller gets success/failure
   }
@@ -838,27 +1064,30 @@ export class PluginManager {
   async installPlugin(pluginDir, options = {}) {
     return this._enqueue(async () => {
       const dirName = path.basename(pluginDir);
-      const source = options.source === "dev" ? "dev" : "community";
+      const source = normalizePluginSource(options.source);
       const desc = this._readPluginDescriptor(pluginDir, dirName);
       desc.source = source;
+      desc.pluginKey = createPluginKey(source, desc.id);
       // Check for existing (upgrade scenario)
-      const existing = [...this._plugins.values()].find(
-        p => p.id === (options.pluginId || desc.id) || path.basename(p.pluginDir) === dirName
-      );
+      const existing = this.findPluginEntry({ id: options.pluginId || desc.id, source })
+        || [...this._plugins.values()].find(
+          p => p.source === source && path.basename(p.pluginDir) === dirName
+        );
       if (existing) {
-        await this.unloadPlugin(existing.id);
-        this._plugins.delete(existing.id);
+        await this.unloadPlugin(existing.id, { pluginKey: existing.pluginKey });
+        this._plugins.delete(existing.pluginKey);
       }
 
       const disabledList = source === "dev"
         ? []
         : (this._preferencesManager?.getDisabledPlugins() || []);
 
-      const entry = { ...desc, status: "loading", activationState: "inactive", activationReason: null, instance: null, _disposables: [] };
-      this._plugins.set(desc.id, entry);
+      const entry = this._entryFromDescriptor(desc, { status: "loading", activationState: "inactive", activationReason: null, instance: null, _disposables: [] });
+      this._setPluginEntry(entry);
 
       if (disabledList.includes(desc.id)) {
         entry.status = "disabled";
+        this._refreshRouteRegistryForId(entry.id);
         return entry;
       }
 
@@ -866,11 +1095,13 @@ export class PluginManager {
         entry.status = "incompatible";
         entry.error = desc.formatIssue.message;
         this._bus?.emit({ type: "plugin_ui_changed" });
+        this._refreshRouteRegistryForId(entry.id);
         return entry;
       }
 
       if (desc.trust === "full-access" && !this._isFullAccessAllowed(entry, options)) {
         entry.status = "restricted";
+        this._refreshRouteRegistryForId(entry.id);
         return entry;
       }
 
@@ -879,6 +1110,7 @@ export class PluginManager {
         entry.status = "incompatible";
         entry.error = `requires app v${minVer}+, current v${this._appVersion}`;
         this._bus?.emit({ type: "plugin_ui_changed" });
+        this._refreshRouteRegistryForId(entry.id);
         return entry;
       }
 
@@ -890,6 +1122,7 @@ export class PluginManager {
         entry.status = "failed";
         entry.error = err.message;
       }
+      this._refreshRouteRegistryForId(entry.id);
       this._bus?.emit({ type: "plugin_ui_changed" });
       return entry;
     });
@@ -897,24 +1130,25 @@ export class PluginManager {
 
   async removePlugin(pluginId, options = {}) {
     return this._enqueue(async () => {
-      const entry = this._plugins.get(pluginId);
+      const entry = this._resolvePluginEntry(pluginId, options);
       if (!entry) throw new Error(`Plugin "${pluginId}" not found`);
       if (entry.source === "builtin") throw new Error(`Builtin plugin "${pluginId}" cannot be removed`);
       if (entry.status === "loaded" || entry.status === "failed") {
-        await this.unloadPlugin(pluginId);
+        await this.unloadPlugin(entry.id, { pluginKey: entry.pluginKey });
       }
-      this._plugins.delete(pluginId);
+      this._plugins.delete(entry.pluginKey);
       if (entry.source === "dev" || options.persist === false) {
         // Dev plugin removal is scoped to the dev slot and must not mutate the
         // user's persisted disabled community plugin list.
       } else if (this._preferencesManager) {
         const disabled = this._preferencesManager.getDisabledPlugins();
         this._preferencesManager.setDisabledPlugins(
-          disabled.filter(id => id !== pluginId)
+          disabled.filter(id => id !== entry.id)
         );
       } else {
-        console.warn("[plugin-manager] removePlugin: preferencesManager unavailable, disabled list not updated");
+        log.warn("removePlugin: preferencesManager unavailable, disabled list not updated");
       }
+      this._refreshRouteRegistryForId(entry.id);
       this._bus?.emit({ type: "plugin_ui_changed" });
       return entry.pluginDir;
     });
@@ -922,11 +1156,11 @@ export class PluginManager {
 
   async disablePlugin(pluginId, options = {}) {
     return this._enqueue(async () => {
-      const entry = this._plugins.get(pluginId);
+      const entry = this._resolvePluginEntry(pluginId, options);
       if (!entry) throw new Error(`Plugin "${pluginId}" not found`);
       if (entry.source === "builtin") throw new Error(`Builtin plugin "${pluginId}" cannot be disabled`);
       if (entry.status === "loaded") {
-        await this.unloadPlugin(pluginId);
+        await this.unloadPlugin(entry.id, { pluginKey: entry.pluginKey });
       }
       entry.status = "disabled";
       if (entry.source === "dev" || options.persist === false) {
@@ -934,19 +1168,20 @@ export class PluginManager {
         // the user's persisted disabled community plugin list.
       } else if (this._preferencesManager) {
         const disabled = this._preferencesManager.getDisabledPlugins();
-        if (!disabled.includes(pluginId)) {
-          this._preferencesManager.setDisabledPlugins([...disabled, pluginId]);
+        if (!disabled.includes(entry.id)) {
+          this._preferencesManager.setDisabledPlugins([...disabled, entry.id]);
         }
       } else {
-        console.warn("[plugin-manager] disablePlugin: preferencesManager unavailable, preference not persisted");
+        log.warn("disablePlugin: preferencesManager unavailable, preference not persisted");
       }
+      this._refreshRouteRegistryForId(entry.id);
       this._bus?.emit({ type: "plugin_ui_changed" });
     });
   }
 
   async enablePlugin(pluginId, options = {}) {
     return this._enqueue(async () => {
-      const entry = this._plugins.get(pluginId);
+      const entry = this._resolvePluginEntry(pluginId, options);
       if (!entry) throw new Error(`Plugin "${pluginId}" not found`);
       // builtin 插件始终 loaded，跳过偏好写入
       if (entry.source === "builtin") return;
@@ -956,10 +1191,10 @@ export class PluginManager {
       } else if (this._preferencesManager) {
         const disabled = this._preferencesManager.getDisabledPlugins();
         this._preferencesManager.setDisabledPlugins(
-          disabled.filter(id => id !== pluginId)
+          disabled.filter(id => id !== entry.id)
         );
       } else {
-        console.warn("[plugin-manager] enablePlugin: preferencesManager unavailable, preference not persisted");
+        log.warn("enablePlugin: preferencesManager unavailable, preference not persisted");
       }
       if (entry.trust === "full-access" && !this._isFullAccessAllowed(entry, options)) {
         entry.status = "restricted";
@@ -968,7 +1203,7 @@ export class PluginManager {
       }
       // Guard: unload before re-loading to prevent duplicate tool/command/route registration
       if (entry.status === "loaded") {
-        await this.unloadPlugin(pluginId);
+        await this.unloadPlugin(entry.id, { pluginKey: entry.pluginKey });
       }
       try {
         await this._loadPluginWithBoundary(entry);
@@ -978,6 +1213,7 @@ export class PluginManager {
         entry.status = "failed";
         entry.error = err.message;
       }
+      this._refreshRouteRegistryForId(entry.id);
       this._bus?.emit({ type: "plugin_ui_changed" });
       return entry;
     });
@@ -988,7 +1224,7 @@ export class PluginManager {
       if (this._preferencesManager) {
         this._preferencesManager.setAllowFullAccessPlugins(allow);
       } else {
-        console.warn("[plugin-manager] setFullAccess: preferencesManager unavailable, preference not persisted");
+        log.warn("setFullAccess: preferencesManager unavailable, preference not persisted");
       }
       for (const entry of this._plugins.values()) {
         if (entry.source !== "community" || entry.trust !== "full-access") continue;
@@ -1004,9 +1240,11 @@ export class PluginManager {
             entry.status = "failed";
             entry.error = err.message;
           }
+          this._refreshRouteRegistryForId(entry.id);
         } else if (!allow && entry.status === "loaded") {
-          await this.unloadPlugin(entry.id);
+          await this.unloadPlugin(entry.id, { pluginKey: entry.pluginKey });
           entry.status = "restricted";
+          this._refreshRouteRegistryForId(entry.id);
         }
       }
       this._bus?.emit({ type: "plugin_ui_changed" });
@@ -1017,17 +1255,18 @@ export class PluginManager {
 
   async _cleanupPluginEntry(entry) {
     const pluginId = entry.id;
+    const pluginKey = entry.pluginKey;
 
     // 1. 生命周期清理（onunload + disposables）
     if (entry.instance) {
       if (typeof entry.instance.onunload === "function") {
         try { await entry.instance.onunload(); } catch (err) {
-          console.error(`[plugin-manager] "${pluginId}" onunload error:`, err.message);
+          log.error(`"${pluginId}" onunload error: ${err.message}`);
         }
       }
       for (const d of entry._disposables.reverse()) {
         try { d(); } catch (err) {
-          console.error(`[plugin-manager] "${pluginId}" disposable error:`, err.message);
+          log.error(`"${pluginId}" disposable error: ${err.message}`);
         }
       }
       entry._disposables = [];
@@ -1036,28 +1275,30 @@ export class PluginManager {
     entry.activationState = entry.hasLifecycle ? "inactive" : "none";
 
     // 2. 清理静态贡献（文件约定加载的 tools、commands 等）
-    this._tools = this._tools.filter(t => t._pluginId !== pluginId);
-    this._commands = this._commands.filter(c => c._pluginId !== pluginId);
-    this._slashRegistry?.unregisterBySource("plugin", pluginId);
-    this._skillPaths = this._skillPaths.filter(s => s.label !== `plugin:${pluginId}`);
-    this._agentTemplates = this._agentTemplates.filter(t => t._pluginId !== pluginId);
-    this._providerPlugins = this._providerPlugins.filter(p => p._pluginId !== pluginId);
-    this._configSchemas = this._configSchemas.filter(s => s.pluginId !== pluginId);
-    this._extensionFactories = this._extensionFactories.filter(e => e.pluginId !== pluginId);
-    this._pages = this._pages.filter(p => p.pluginId !== pluginId);
-    this._widgets = this._widgets.filter(w => w.pluginId !== pluginId);
-    this._settingsTabs = this._settingsTabs.filter(t => t.pluginId !== pluginId);
-    this.routeRegistry.delete(pluginId);
+    this._tools = this._tools.filter(t => t._pluginKey !== pluginKey);
+    this._commands = this._commands.filter(c => c._pluginKey !== pluginKey);
+    this._slashRegistry?.unregisterBySource("plugin", pluginKey);
+    this._skillPaths = this._skillPaths.filter(s => s.pluginKey !== pluginKey);
+    this._agentTemplates = this._agentTemplates.filter(t => t._pluginKey !== pluginKey);
+    this._providerPlugins = this._providerPlugins.filter(p => p._pluginKey !== pluginKey);
+    this._configSchemas = this._configSchemas.filter(s => s.pluginKey !== pluginKey);
+    this._extensionFactories = this._extensionFactories.filter(e => e.pluginKey !== pluginKey);
+    this._pages = this._pages.filter(p => p.pluginKey !== pluginKey);
+    this._widgets = this._widgets.filter(w => w.pluginKey !== pluginKey);
+    this._settingsTabs = this._settingsTabs.filter(t => t.pluginKey !== pluginKey);
+    this._routeApps.delete(pluginKey);
+    this._refreshRouteRegistryForId(pluginId);
   }
 
-  async unloadPlugin(pluginId) {
-    const entry = this._plugins.get(pluginId);
+  async unloadPlugin(pluginId, options = {}) {
+    const entry = this._resolvePluginEntry(pluginId, options);
     if (!entry) return;
 
     entry._loadCancelled = true;
     await this._cleanupPluginEntry(entry);
 
     entry.status = "unloaded";
+    this._refreshRouteRegistryForId(entry.id);
   }
 
   // ── Public getters (route 层通过这些方法访问，不穿透私有字段) ──
@@ -1086,28 +1327,45 @@ export class PluginManager {
 
   /** 获取指定插件的路由 app */
   getRouteApp(pluginId) {
+    this._refreshRouteRegistryForId(pluginId);
     return this.routeRegistry.get(pluginId) || null;
   }
 
   /** 获取所有活跃插件的 extension 工厂函数（供 Engine 注入 Pi SDK） */
   getExtensionFactories() {
-    return this._extensionFactories.map(e => e.factory);
+    return this._extensionFactories
+      .filter(e => this._isPluginKeyRuntimeActive(e.pluginKey))
+      .map(e => e.factory);
   }
 
-  getPages() { return [...this._pages]; }
-  getWidgets() { return [...this._widgets]; }
-  getSettingsTabs() { return [...this._settingsTabs]; }
+  getPages(options = {}) {
+    const includeShadowed = options.includeShadowed === true;
+    return this._pages.filter((page) => includeShadowed || this._isPluginKeyRuntimeActive(page.pluginKey));
+  }
+  getWidgets(options = {}) {
+    const includeShadowed = options.includeShadowed === true;
+    return this._widgets.filter((widget) => includeShadowed || this._isPluginKeyRuntimeActive(widget.pluginKey));
+  }
+  getSettingsTabs(options = {}) {
+    const includeShadowed = options.includeShadowed === true;
+    return this._settingsTabs.filter((tab) => includeShadowed || this._isPluginKeyRuntimeActive(tab.pluginKey));
+  }
   getDiagnostics() {
+    this._annotateShadowing();
     return [...this._plugins.values()].map((entry) => {
       const pluginId = entry.id;
       return {
         id: pluginId,
+        pluginKey: entry.pluginKey,
         name: entry.name,
         version: entry.version,
         source: entry.source || "community",
         trust: entry.trust || "restricted",
         hidden: !!entry.hidden,
         status: entry.status,
+        shadowedBy: entry.shadowedBy || null,
+        shadowedByPluginKey: entry.shadowedByPluginKey || null,
+        shadows: Array.isArray(entry.shadows) ? [...entry.shadows] : [],
         error: entry.error || null,
         activationState: entry.activationState || null,
         activationEvents: Array.isArray(entry.activationEvents) ? [...entry.activationEvents] : [],
@@ -1117,19 +1375,19 @@ export class PluginManager {
         contributions: Array.isArray(entry.contributions) ? [...entry.contributions] : [],
         uiHostCapabilities: Array.isArray(entry.uiHostCapabilities) ? [...entry.uiHostCapabilities] : [],
         routes: {
-          hasRouteApp: this.routeRegistry.has(pluginId),
-          pages: this._pages.filter((item) => item.pluginId === pluginId).map(clonePlain),
-          widgets: this._widgets.filter((item) => item.pluginId === pluginId).map(clonePlain),
-          settingsTabs: this._settingsTabs.filter((item) => item.pluginId === pluginId).map(clonePlain),
+          hasRouteApp: this._isPluginKeyRuntimeActive(entry.pluginKey) && this._routeApps.has(entry.pluginKey),
+          pages: this._pages.filter((item) => item.pluginKey === entry.pluginKey).map(clonePlain),
+          widgets: this._widgets.filter((item) => item.pluginKey === entry.pluginKey).map(clonePlain),
+          settingsTabs: this._settingsTabs.filter((item) => item.pluginKey === entry.pluginKey).map(clonePlain),
         },
         tools: this._tools
-          .filter((item) => item._pluginId === pluginId)
+          .filter((item) => item._pluginKey === entry.pluginKey)
           .map((item) => ({ name: item.name, dynamic: !!item._dynamic })),
         commands: this._commands
-          .filter((item) => item._pluginId === pluginId)
+          .filter((item) => item._pluginKey === entry.pluginKey)
           .map((item) => ({ name: item.name })),
         providers: this._providerPlugins
-          .filter((item) => item._pluginId === pluginId)
+          .filter((item) => item._pluginKey === entry.pluginKey)
           .map((item) => ({ id: item.id, name: item.name || item.id })),
         config: {
           hasSchema: !!entry.configSchema,
@@ -1140,15 +1398,33 @@ export class PluginManager {
   }
   getUiHostCapabilityGrants() {
     return [...this._plugins.values()]
-      .filter(entry => entry.status === "loaded" && Array.isArray(entry.uiHostCapabilities) && entry.uiHostCapabilities.length > 0)
+      .filter(entry => (
+        entry.status === "loaded"
+        && this._isPluginKeyRuntimeActive(entry.pluginKey)
+        && Array.isArray(entry.uiHostCapabilities)
+        && entry.uiHostCapabilities.length > 0
+      ))
       .map(entry => ({
         pluginId: entry.id,
+        pluginKey: entry.pluginKey,
+        source: entry.source,
         hostCapabilities: [...entry.uiHostCapabilities],
       }));
   }
 
-  getPlugin(id) { return this._plugins.get(id) || null; }
-  listPlugins() { return [...this._plugins.values()]; }
+  getPlugin(id, options = {}) {
+    this._annotateShadowing();
+    return this._resolvePluginEntry(id, options) || null;
+  }
+  listPlugins(options = {}) {
+    this._annotateShadowing();
+    let entries = [...this._plugins.values()];
+    if (options.source) {
+      const source = normalizePluginSource(options.source);
+      entries = entries.filter((entry) => entry.source === source);
+    }
+    return entries;
+  }
 }
 
 function clonePlain(value) {

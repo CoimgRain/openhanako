@@ -1,7 +1,7 @@
-; installer.nsh - NSIS custom hooks for Hanako installer
+; installer.nsh - NSIS custom hooks for HanaAgent installer
 ;
-; Owns the Windows overlay boundary for Hanako installs. The installer may
-; replace Hana-owned program files, while user/runtime state stays outside
+; Owns the Windows overlay boundary for HanaAgent installs. The installer may
+; replace HanaAgent-owned program files, while user/runtime state stays outside
 ; $INSTDIR.
 
 ; Disable CRC integrity check. electron-builder's post-compilation PE editing
@@ -17,7 +17,10 @@ CRCCheck off
 !macroend
 
 !macro hanakoFindRunningProcesses _RETURN
-  !insertmacro hanakoFindProcess Hanako.exe ${_RETURN}
+  !insertmacro hanakoFindProcess HanaAgent.exe ${_RETURN}
+  ${If} ${_RETURN} != 0
+    !insertmacro hanakoFindProcess Hanako.exe ${_RETURN}
+  ${EndIf}
   ${If} ${_RETURN} != 0
     !insertmacro hanakoFindProcess hana-server.exe ${_RETURN}
   ${EndIf}
@@ -38,8 +41,51 @@ CRCCheck off
 !macroend
 
 !macro hanakoKillRunningProcesses _FORCE
+  !insertmacro hanakoKillProcess HanaAgent.exe ${_FORCE}
   !insertmacro hanakoKillProcess Hanako.exe ${_FORCE}
   !insertmacro hanakoKillProcess hana-server.exe ${_FORCE}
+!macroend
+
+!macro hanakoRequireInstallSurfaceFile _PATH _LABEL
+  IfFileExists "${_PATH}" +2 0
+    StrCpy $R2 "$R2$\r$\n- ${_LABEL}: ${_PATH}"
+!macroend
+
+!macro hanakoVerifyInstallSurface
+  Push $0
+  Push $R2
+  StrCpy $R2 ""
+  !insertmacro hanakoRequireInstallSurfaceFile "$INSTDIR\${APP_EXECUTABLE_FILENAME}" "HanaAgent.exe"
+  !insertmacro hanakoRequireInstallSurfaceFile "$INSTDIR\resources\app.asar" "resources\app.asar"
+  !insertmacro hanakoRequireInstallSurfaceFile "$INSTDIR\resources\app-update.yml" "resources\app-update.yml"
+  !insertmacro hanakoRequireInstallSurfaceFile "$INSTDIR\resources\server\hana-server.exe" "resources\server\hana-server.exe"
+  !insertmacro hanakoRequireInstallSurfaceFile "$INSTDIR\resources\server\bootstrap.js" "resources\server\bootstrap.js"
+  !insertmacro hanakoRequireInstallSurfaceFile "$INSTDIR\resources\server\bundle\index.js" "resources\server\bundle\index.js"
+  !insertmacro hanakoRequireInstallSurfaceFile "$INSTDIR\resources\server\node_modules\better-sqlite3\build\Release\better_sqlite3.node" "better-sqlite3 native addon"
+  !insertmacro hanakoRequireInstallSurfaceFile "$INSTDIR\resources\git\cmd\git.exe" "PortableGit git.exe"
+  IfFileExists "$INSTDIR\resources\git\bin\bash.exe" +3 0
+    IfFileExists "$INSTDIR\resources\git\usr\bin\bash.exe" +2 0
+      StrCpy $R2 "$R2$\r$\n- PortableGit bash.exe: $INSTDIR\resources\git\bin\bash.exe or $INSTDIR\resources\git\usr\bin\bash.exe"
+
+  ${If} $R2 != ""
+    DetailPrint "HanaAgent install surface self-check failed."
+    FileOpen $0 "$INSTDIR\hanaagent-install-diagnostics.log" w
+    FileWrite $0 "HanaAgent install surface self-check failed.$\r$\n"
+    FileWrite $0 "Install dir: $INSTDIR$\r$\n"
+    FileWrite $0 "Missing or unreadable files:$R2$\r$\n"
+    FileClose $0
+    MessageBox MB_OK|MB_ICONSTOP "HanaAgent installation is incomplete. Missing or unreadable files:$R2$\r$\n$\r$\nDiagnostic file:$\r$\n$INSTDIR\hanaagent-install-diagnostics.log"
+    SetErrorLevel 1
+    Pop $R2
+    Pop $0
+    Quit
+  ${Else}
+    Delete "$INSTDIR\hanaagent-install-diagnostics.log"
+    Delete "$INSTDIR\hanako-install-diagnostics.log"
+    DetailPrint "HanaAgent install surface self-check passed."
+  ${EndIf}
+  Pop $R2
+  Pop $0
 !macroend
 
 !macro hanakoWriteInstallDirProcessCleaner _SCRIPT
@@ -101,7 +147,7 @@ CRCCheck off
   FileWrite $0 `  $$_.ProcessId -ne $$selfPid -and $$_.ProcessId -ne $$installerPid -and ((Test-HanaPath $$_.ExecutablePath) -or (Test-HanaCommand $$_.CommandLine))$\r$\n`
   FileWrite $0 `})$\r$\n`
   FileWrite $0 `$$matches | ForEach-Object {$\r$\n`
-  FileWrite $0 `  Write-Output ("Hanako-owned process still running: {0} pid={1} path={2}" -f $$_.Name, $$_.ProcessId, $$_.ExecutablePath)$\r$\n`
+  FileWrite $0 `  Write-Output ("HanaAgent-owned process still running: {0} pid={1} path={2}" -f $$_.Name, $$_.ProcessId, $$_.ExecutablePath)$\r$\n`
   FileWrite $0 `}$\r$\n`
   FileWrite $0 `if ($$matches.Count -gt 0) { exit 0 } else { exit 1 }$\r$\n`
   FileClose $0
@@ -138,7 +184,7 @@ CRCCheck off
 
 !macro hanakoBypassOldUninstallerForUpdate
   ${If} ${isUpdated}
-    DetailPrint "Update mode detected; bypassing the previous uninstaller and preparing a Hana-owned overlay."
+    DetailPrint "Update mode detected; bypassing the previous uninstaller and preparing a HanaAgent-owned overlay."
     !insertmacro hanakoPrepareOwnedOverlay
     DeleteRegKey SHELL_CONTEXT "${UNINSTALL_REGISTRY_KEY}"
     !ifdef UNINSTALL_REGISTRY_KEY_2
@@ -159,6 +205,7 @@ CRCCheck off
 !macroend
 
 !macro customInstall
+  !insertmacro hanakoVerifyInstallSurface
   ${If} ${isUpdated}
   ${AndIf} ${isForceRun}
     HideWindow
@@ -191,7 +238,7 @@ CRCCheck off
   !insertmacro hanakoStopInstallDirProcesses
   !insertmacro hanakoFindInstallDirProcesses $R0
   ${If} $R0 == 0
-    DetailPrint "Detected Hanako-owned process in install directory; closing it before install."
+    DetailPrint "Detected HanaAgent-owned process in install directory; closing it before install."
     Sleep 500
     !insertmacro hanakoStopInstallDirProcesses
 
@@ -200,9 +247,9 @@ CRCCheck off
       !insertmacro hanakoFindInstallDirProcesses $R0
       ${If} $R0 == 0
         IntOp $R1 $R1 + 1
-        DetailPrint "Waiting for Hanako-owned install-directory processes to close."
+        DetailPrint "Waiting for HanaAgent-owned install-directory processes to close."
         ${If} $R1 > 2
-          DetailPrint "Hanako-owned install-directory processes still running; asking user to retry."
+          DetailPrint "HanaAgent-owned install-directory processes still running; asking user to retry."
           MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION "$(appCannotBeClosed)" /SD IDCANCEL IDRETRY hanako_retry_install_dir_close
           Quit
           hanako_retry_install_dir_close:
@@ -217,7 +264,7 @@ CRCCheck off
   ${IfNot} ${isUpdated}
   !insertmacro hanakoFindRunningProcesses $R0
   ${If} $R0 == 0
-    DetailPrint "Detected Hanako.exe or hana-server.exe; closing them before install."
+    DetailPrint "Detected HanaAgent.exe, Hanako.exe, or hana-server.exe; closing them before install."
     !insertmacro hanakoKillRunningProcesses 0
     Sleep 500
 
@@ -232,9 +279,9 @@ CRCCheck off
       !insertmacro hanakoFindRunningProcesses $R0
       ${If} $R0 == 0
         IntOp $R1 $R1 + 1
-        DetailPrint "Waiting for Hanako.exe or hana-server.exe to close."
+        DetailPrint "Waiting for HanaAgent.exe, Hanako.exe, or hana-server.exe to close."
         ${If} $R1 > 2
-          DetailPrint "Hanako.exe or hana-server.exe still running; asking user to retry."
+          DetailPrint "HanaAgent.exe, Hanako.exe, or hana-server.exe still running; asking user to retry."
           MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION "$(appCannotBeClosed)" /SD IDCANCEL IDRETRY hanako_retry_close
           Quit
           hanako_retry_close:
@@ -257,11 +304,12 @@ CRCCheck off
 !macroend
 
 !macro hanakoRemoveOwnedInstallTrees
-  DetailPrint "Removing Hana-owned install files"
+  DetailPrint "Removing HanaAgent-owned install files"
   SetOutPath "$TEMP"
   RMDir /r "$INSTDIR\resources\server"
   RMDir /r "$INSTDIR\resources\git"
   RMDir /r "$INSTDIR\resources\screenshot-themes"
+  RMDir /r "$INSTDIR\resources\app"
   RMDir /r "$INSTDIR\resources\app.asar.unpacked"
   Delete "$INSTDIR\resources\app.asar"
   Delete "$INSTDIR\resources\app-update.yml"
@@ -296,9 +344,9 @@ CRCCheck off
 
 !macro customUnInstallCheck
   ${If} ${Errors}
-    DetailPrint `Previous uninstaller could not be launched; preparing a Hana-owned overlay.`
+    DetailPrint `Previous uninstaller could not be launched; preparing a HanaAgent-owned overlay.`
   ${ElseIf} $R0 != 0
-    DetailPrint `Previous uninstaller exited with code $R0; preparing a Hana-owned overlay.`
+    DetailPrint `Previous uninstaller exited with code $R0; preparing a HanaAgent-owned overlay.`
   ${EndIf}
   !insertmacro hanakoPrepareOwnedOverlay
   ClearErrors
@@ -306,9 +354,9 @@ CRCCheck off
 
 !macro customUnInstallCheckCurrentUser
   ${If} ${Errors}
-    DetailPrint `Previous current-user uninstaller could not be launched; continuing with Hana-owned overlay.`
+    DetailPrint `Previous current-user uninstaller could not be launched; continuing with HanaAgent-owned overlay.`
   ${ElseIf} $R0 != 0
-    DetailPrint `Previous current-user uninstaller exited with code $R0; continuing with Hana-owned overlay.`
+    DetailPrint `Previous current-user uninstaller exited with code $R0; continuing with HanaAgent-owned overlay.`
   ${EndIf}
   !insertmacro hanakoPrepareOwnedOverlay
   ClearErrors

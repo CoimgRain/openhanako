@@ -1,7 +1,20 @@
 import { describe, expect, it, vi } from "vitest";
-import { createChatRoute } from "../server/routes/chat.js";
+import {
+  DEFAULT_DISCONNECT_ABORT_GRACE_MS,
+  createChatRoute,
+  resolveDisconnectAbortGraceMs,
+} from "../server/routes/chat.js";
 
 describe("chat route model switch guard", () => {
+  it("uses a minute-scale default WS disconnect abort grace and allows disabling it", () => {
+    expect(DEFAULT_DISCONNECT_ABORT_GRACE_MS).toBeGreaterThanOrEqual(60_000);
+    expect(resolveDisconnectAbortGraceMs(undefined)).toBe(DEFAULT_DISCONNECT_ABORT_GRACE_MS);
+    expect(resolveDisconnectAbortGraceMs("0")).toBe(0);
+    expect(resolveDisconnectAbortGraceMs("45000")).toBe(45_000);
+    expect(resolveDisconnectAbortGraceMs("-1")).toBe(DEFAULT_DISCONNECT_ABORT_GRACE_MS);
+    expect(resolveDisconnectAbortGraceMs("bad")).toBe(DEFAULT_DISCONNECT_ABORT_GRACE_MS);
+  });
+
   it("rejects prompts through the engine public switching API", async () => {
     let createHandlers;
     const upgradeWebSocket = vi.fn((factory) => {
@@ -232,5 +245,50 @@ describe("chat route model switch guard", () => {
     ]));
 
     handlers.onClose({}, ws);
+  });
+
+  it("does not serialize broadcast payloads for closed clients", () => {
+    let createHandlers;
+    let subscriber;
+    const upgradeWebSocket = vi.fn((factory) => {
+      createHandlers = factory;
+      return () => new Response(null);
+    });
+    const hub = {
+      subscribe: vi.fn((fn) => {
+        subscriber = fn;
+      }),
+      send: vi.fn(async () => {}),
+    };
+    const engine = {
+      agentName: "Hana",
+      abortAllStreaming: vi.fn(async () => {}),
+      getSessionByPath: vi.fn(() => ({ entries: [] })),
+      isSessionStreaming: vi.fn(() => false),
+      isSessionSwitching: vi.fn(() => false),
+      steerSession: vi.fn(() => false),
+      slashDispatcher: null,
+    };
+
+    createChatRoute(engine, hub, { upgradeWebSocket });
+    const handlers = createHandlers({});
+    const closedWs = { readyState: 3, send: vi.fn() };
+    handlers.onOpen({}, closedWs);
+
+    const toxicSession = {
+      toJSON() {
+        throw new Error("closed clients must not force serialization");
+      },
+    };
+
+    expect(() => {
+      subscriber?.({
+        type: "session_created",
+        session: toxicSession,
+      }, "/tmp/closed-client-session.jsonl");
+    }).not.toThrow();
+    expect(closedWs.send).not.toHaveBeenCalled();
+
+    handlers.onClose({}, closedWs);
   });
 });

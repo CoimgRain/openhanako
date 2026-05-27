@@ -72,6 +72,9 @@ describe("AgentManager.createAgent default skills.enabled", () => {
   let skillsMock;
 
   function seedTemplate(enabledLiteral = '["skill-creator"]') {
+    fs.mkdirSync(path.join(productDir, "yuan"), { recursive: true });
+    fs.writeFileSync(path.join(productDir, "yuan", "hanako.md"), "Hanako yuan\n", "utf-8");
+    fs.writeFileSync(path.join(productDir, "yuan", "ming.md"), "Ming yuan\n", "utf-8");
     fs.writeFileSync(
       path.join(productDir, "config.example.yaml"),
       [
@@ -136,7 +139,7 @@ describe("AgentManager.createAgent default skills.enabled", () => {
       _allSkills: [],
       computeDefaultEnabledForNewAgent() {
         return this._allSkills
-          .filter((s) => s.source !== "learned" && s.source !== "external")
+          .filter((s) => s.source !== "external" && s.defaultEnabled !== false)
           .map((s) => s.name);
       },
       syncAgentSkills: vi.fn(),
@@ -153,7 +156,7 @@ describe("AgentManager.createAgent default skills.enabled", () => {
     skillsMock._allSkills = [
       { name: "pdf", source: "user" },
       { name: "docx", source: "user" },
-      { name: "learned-one", source: "learned", _agentId: "someone-else" },
+      { name: "migrated-one", source: "user", defaultEnabled: false },
       { name: "ext-one", source: "external" },
     ];
 

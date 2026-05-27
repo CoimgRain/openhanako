@@ -88,6 +88,7 @@ function makeTicker(tmpDir, isSessionMemoryEnabled) {
     getResolvedMemoryModel: () => ({ model: "test-model", provider: "test", api: "openai-completions", api_key: "test-key", base_url: "http://localhost:1234" }),
     getMemoryMasterEnabled: () => true,
     isSessionMemoryEnabled,
+    getTimezone: () => "Asia/Shanghai",
     onCompiled: vi.fn(),
     sessionDir: path.join(tmpDir, "sessions"),
     memoryDir,
@@ -153,6 +154,26 @@ describe("memory ticker respects session-level memory toggle", () => {
     expect(assemble).toHaveBeenCalled();
   });
 
+  it("flushSessionAndCompile summarizes an unfinished turn bucket and resets the turn count", async () => {
+    const { ticker, summaryManager } = makeTicker(tmpDir, () => true);
+
+    for (let i = 0; i < 9; i++) ticker.notifyTurn(sessionPath);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    vi.clearAllMocks();
+
+    await ticker.flushSessionAndCompile(sessionPath);
+
+    expect(summaryManager.rollingSummary).toHaveBeenCalledOnce();
+    expect(compileToday).toHaveBeenCalledOnce();
+    expect(assemble).toHaveBeenCalledOnce();
+
+    ticker.notifyTurn(sessionPath);
+
+    expect(summaryManager.rollingSummary).toHaveBeenCalledOnce();
+    expect(compileToday).toHaveBeenCalledOnce();
+    expect(assemble).toHaveBeenCalledOnce();
+  });
+
   it("notifySessionEnd 是 fire-and-forget：即使 rollingSummary 永不 resolve，caller 也能立即继续", async () => {
     const summaryManager = {
       rollingSummary: vi.fn(() => new Promise(() => {})), // 永不 resolve
@@ -208,6 +229,35 @@ describe("memory ticker respects session-level memory toggle", () => {
     expect(summaryManager.rollingSummary.mock.calls[0][3]).toEqual({
       resetAt: "2026-04-29T08:00:00.000Z",
       timeZone: "Asia/Shanghai",
+    });
+  });
+
+  it("passes the session memory reflection snapshot from session-meta into rollingSummary", async () => {
+    const metaPath = path.join(tmpDir, "sessions", "session-meta.json");
+    const snapshot = {
+      version: 1,
+      agentName: "Hana",
+      userName: "测试用户",
+      identityAndPersonality: "Hana 的人格设定。",
+      userProfile: "测试用户的主人设定。",
+      existingMemory: "已有长期记忆。",
+      roster: "同处于这个系统里的别的 Agent：Butter。",
+    };
+    fs.writeFileSync(metaPath, JSON.stringify({
+      [path.basename(sessionPath)]: {
+        memoryReflectionSnapshot: snapshot,
+      },
+    }, null, 2), "utf-8");
+    const { ticker, summaryManager } = makeTicker(tmpDir, () => true);
+
+    ticker.notifyTurn(sessionPath);
+    await ticker.notifySessionEnd(sessionPath);
+
+    expect(summaryManager.rollingSummary).toHaveBeenCalledOnce();
+    expect(summaryManager.rollingSummary.mock.calls[0][3]).toEqual({
+      resetAt: null,
+      timeZone: "Asia/Shanghai",
+      memoryReflectionSnapshot: snapshot,
     });
   });
 

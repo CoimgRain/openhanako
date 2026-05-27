@@ -21,6 +21,8 @@ vi.mock("../lib/pi-sdk/index.js", () => ({
   SettingsManager: {
     inMemory: vi.fn(() => ({})),
   },
+  resizeModelImageInput: vi.fn(async (image) => image),
+  formatModelImageDimensionNote: vi.fn(() => undefined),
 }));
 
 vi.mock("../lib/debug-log.js", () => ({
@@ -32,6 +34,9 @@ vi.mock("../lib/debug-log.js", () => ({
 }));
 
 import { SessionCoordinator } from "../core/session-coordinator.js";
+import { VisionBridge, VISION_CONTEXT_START } from "../core/vision-bridge.js";
+
+const PNG_BASE64 = "iVBORw0KGgo=";
 
 describe("SessionCoordinator", () => {
   let tempDir;
@@ -99,6 +104,158 @@ describe("SessionCoordinator", () => {
     expect(agent.setMemoryEnabled).toHaveBeenCalledWith(false);
     expect(createAgentSessionMock).toHaveBeenCalledOnce();
     expect(createAgentSessionMock.mock.calls[0][0].resourceLoader.getSystemPrompt()).toBe("MEMORY OFF");
+  });
+
+  it("injects restored vision sidecar notes without reading stale Pi context getters", async () => {
+    const sessionFile = path.join(tempDir, "vision-restore.jsonl");
+    const imagePath = path.join(tempDir, "upload.png");
+    const textOnlyModel = { id: "deepseek-chat", provider: "deepseek", input: ["text"] };
+    const callText = vi.fn(async () => [
+      "image_overview: A screenshot with a red error banner.",
+      "user_request_answer: The error banner is the relevant visual detail.",
+      "evidence: red banner.",
+      "uncertainty: none.",
+    ].join("\n"));
+    const visionBridge = new VisionBridge({
+      resolveVisionConfig: () => ({
+        model: { id: "qwen-vl", provider: "dashscope", input: ["text", "image"] },
+        api: "openai-completions",
+        api_key: "sk-test",
+        base_url: "https://example.test/v1",
+      }),
+      callText,
+    });
+    await visionBridge.prepare({
+      sessionPath: sessionFile,
+      targetModel: textOnlyModel,
+      text: `[attached_image: ${imagePath}]\nwhat is this?`,
+      images: [{ type: "image", data: PNG_BASE64, mimeType: "image/png" }],
+      imageAttachmentPaths: [imagePath],
+    });
+    const agent = {
+      id: "hana",
+      agentDir: tempDir,
+      sessionDir: tempDir,
+      sessionMemoryEnabled: true,
+      memoryMasterEnabled: true,
+      config: { locale: "zh-CN" },
+      setMemoryEnabled: vi.fn(),
+      buildSystemPrompt: () => "BASE",
+      tools: [],
+    };
+    sessionManagerCreateMock.mockReturnValue({
+      getCwd: () => tempDir,
+      getSessionFile: () => sessionFile,
+    });
+    createAgentSessionMock.mockResolvedValueOnce({
+      session: {
+        sessionManager: { getSessionFile: () => sessionFile },
+        subscribe: vi.fn(() => vi.fn()),
+        setActiveToolsByName: vi.fn(),
+        model: textOnlyModel,
+      },
+    });
+
+    const coordinator = new SessionCoordinator({
+      agentsDir: tempDir,
+      getAgent: () => agent,
+      getActiveAgentId: () => "hana",
+      getModels: () => ({
+        currentModel: textOnlyModel,
+        authStorage: {},
+        modelRegistry: {},
+        resolveThinkingLevel: () => "medium",
+      }),
+      getResourceLoader: () => ({
+        getSystemPrompt: () => "BASE",
+        getAppendSystemPrompt: () => [],
+        getExtensions: () => ({ extensions: [], errors: [] }),
+      }),
+      getSkills: () => null,
+      buildTools: () => ({ tools: [], customTools: [] }),
+      emitEvent: () => {},
+      getHomeCwd: () => tempDir,
+      agentIdFromSessionPath: () => "hana",
+      switchAgentOnly: async () => {},
+      getConfig: () => ({}),
+      getPrefs: () => ({ getThinkingLevel: () => "medium" }),
+      getAgents: () => new Map(),
+      getActivityStore: () => null,
+      getAgentById: () => agent,
+      listAgents: () => [],
+      getEngine: () => ({
+        isVisionAuxiliaryEnabled: () => true,
+        getVisionBridge: () => visionBridge,
+        getSessionFile: vi.fn(),
+        getSessionFileByPath: vi.fn(),
+      }),
+    });
+
+    await coordinator.createSession(null, tempDir, true);
+
+    const resourceLoader = createAgentSessionMock.mock.calls.at(-1)[0].resourceLoader;
+    const extension = resourceLoader.getExtensions().extensions
+      .find((entry) => entry.path === "hana-desktop-vision-context-injection");
+    const handler = extension.handlers.get("context")[0];
+    const staleCtx = {
+      get sessionManager() {
+        throw new Error("stale session manager");
+      },
+      get model() {
+        throw new Error("stale model");
+      },
+    };
+
+    const result = await handler({
+      messages: [{
+        role: "user",
+        content: [{ type: "text", text: `[attached_image: ${imagePath}]\nwhat is this?` }],
+      }],
+    }, staleCtx);
+
+    expect(result.messages[0].content[0].text).toContain(VISION_CONTEXT_START);
+    expect(result.messages[0].content[0].text).toContain("image_overview");
+  });
+
+  it("passes desktop steer text to the SDK without adding an internal prefix", () => {
+    const sessionPath = path.join(tempDir, "steer.jsonl");
+    const session = {
+      isStreaming: true,
+      steer: vi.fn(),
+    };
+    const coordinator = new SessionCoordinator({
+      agentsDir: tempDir,
+      getAgent: () => null,
+      getActiveAgentId: () => "hana",
+      getModels: () => ({
+        currentModel: { name: "test-model" },
+        authStorage: {},
+        modelRegistry: {},
+        resolveThinkingLevel: () => "medium",
+      }),
+      getResourceLoader: () => null,
+      getSkills: () => null,
+      buildTools: () => ({ tools: [], customTools: [] }),
+      emitEvent: () => {},
+      getHomeCwd: () => tempDir,
+      agentIdFromSessionPath: () => "hana",
+      switchAgentOnly: async () => {},
+      getConfig: () => ({}),
+      getPrefs: () => ({ getThinkingLevel: () => "medium" }),
+      getAgents: () => new Map(),
+      getActivityStore: () => null,
+      getAgentById: () => null,
+      listAgents: () => [],
+    });
+    coordinator._sessions.set(sessionPath, {
+      session,
+      agentId: "hana",
+      lastTouchedAt: 0,
+      visibleInSessionList: true,
+    });
+
+    expect(coordinator.steerSession(sessionPath, "先别展开，直接给结论")).toBe(true);
+    expect(session.steer).toHaveBeenCalledWith("先别展开，直接给结论");
   });
 
   it("lists sessions from a lightweight projection without delegating to the Pi SDK full scan", async () => {
@@ -431,7 +588,7 @@ describe("SessionCoordinator", () => {
     });
 
     const promptPromise = coordinator.promptSession(sessionPath, "describe image", {
-      images: [{ type: "image", data: "ZmFrZQ==", mimeType: "image/png" }],
+      images: [{ type: "image", data: PNG_BASE64, mimeType: "image/png" }],
     });
     await prepareStarted;
 
@@ -1473,6 +1630,12 @@ describe("SessionCoordinator", () => {
       buildSystemPrompt: vi.fn(({ forceMemoryEnabled } = {}) =>
         forceMemoryEnabled ? "MEMORY ON" : "MEMORY OFF",
       ),
+      buildMemoryReflectionSnapshot: vi.fn(({ forceMemoryEnabled } = {}) => ({
+        version: 1,
+        agentName: "Hana",
+        userName: "测试用户",
+        existingMemory: forceMemoryEnabled ? "已有长期记忆" : "",
+      })),
       config: { tools: {} },
       tools: [{ name: "todo_write" }],
     };
@@ -1524,6 +1687,197 @@ describe("SessionCoordinator", () => {
     expect(createAgentSessionMock.mock.calls[0][0].resourceLoader.getSystemPrompt()).toBe("MEMORY OFF");
     const meta = JSON.parse(fs.readFileSync(path.join(tempDir, "hana", "sessions", "session-meta.json"), "utf-8"));
     expect(meta[path.basename(sessionFile)].memoryEnabled).toBe(false);
+    expect(agent.buildMemoryReflectionSnapshot).toHaveBeenCalledWith({
+      forceMemoryEnabled: false,
+    });
+    expect(meta[path.basename(sessionFile)].memoryReflectionSnapshot).toEqual({
+      version: 1,
+      agentName: "Hana",
+      userName: "测试用户",
+      existingMemory: "",
+    });
+  });
+
+  it("blocks provider calls when an existing session cache prefix mutates without renew", async () => {
+    const sessionFile = path.join(tempDir, "hana", "sessions", "cache-contract.jsonl");
+    const model = {
+      id: "deepseek-v4-pro",
+      provider: "deepseek",
+      api: "openai-completions",
+      baseUrl: "https://api.deepseek.com",
+      contextWindow: 1000000,
+      maxTokens: 32000,
+    };
+    const readTool = { name: "read", description: "Read files", parameters: { type: "object" } };
+    const bashTool = { name: "bash", description: "Run shell", parameters: { type: "object" } };
+    const activeTools = new Map([["read", readTool], ["bash", bashTool]]);
+    const originalStreamFn = vi.fn(async () => "ok");
+    const session = {
+      sessionManager: { getSessionFile: () => sessionFile },
+      subscribe: vi.fn(() => vi.fn()),
+      model,
+      getContextUsage: () => ({ tokens: 0 }),
+      setActiveToolsByName: vi.fn((names) => {
+        session.agent.state.tools = names.map((name) => activeTools.get(name)).filter(Boolean);
+      }),
+      agent: {
+        streamFn: originalStreamFn,
+        state: {
+          model,
+          systemPrompt: "FINAL CACHE PREFIX",
+          tools: [readTool, bashTool],
+          messages: [],
+        },
+      },
+    };
+    createAgentSessionMock.mockResolvedValue({ session });
+
+    const agent = {
+      id: "hana",
+      agentDir: tempDir,
+      sessionDir: tempDir,
+      sessionMemoryEnabled: true,
+      setMemoryEnabled: vi.fn(),
+      buildSystemPrompt: () => "FROZEN BASE",
+      getToolsSnapshot: () => [],
+      config: { tools: {} },
+      tools: [],
+    };
+    const coordinator = new SessionCoordinator({
+      agentsDir: tempDir,
+      getAgent: () => agent,
+      getActiveAgentId: () => "hana",
+      getModels: () => ({
+        currentModel: model,
+        authStorage: {},
+        modelRegistry: {},
+        resolveThinkingLevel: () => "medium",
+      }),
+      getResourceLoader: () => ({
+        getSystemPrompt: () => "BASE",
+        getAppendSystemPrompt: () => [],
+        getExtensions: () => ({ extensions: [], errors: [] }),
+      }),
+      getSkills: () => null,
+      buildTools: () => ({ tools: [readTool, bashTool], customTools: [] }),
+      emitEvent: () => {},
+      getHomeCwd: () => "/tmp/home",
+      agentIdFromSessionPath: () => "hana",
+      switchAgentOnly: async () => {},
+      getConfig: () => ({}),
+      getPrefs: () => ({ getThinkingLevel: () => "medium" }),
+      getAgents: () => new Map(),
+      getActivityStore: () => null,
+      getAgentById: () => agent,
+      listAgents: () => [],
+    });
+
+    await coordinator.createSession(null, "/tmp/workspace", true);
+
+    await expect(session.agent.streamFn(model, {
+      systemPrompt: "FINAL CACHE PREFIX",
+      tools: [readTool, bashTool],
+      messages: [{ role: "user", content: "hello" }],
+    }, {})).resolves.toBe("ok");
+
+    await expect(session.agent.streamFn(model, {
+      systemPrompt: "MUTATED CACHE PREFIX",
+      tools: [readTool, bashTool],
+      messages: [
+        { role: "user", content: "hello" },
+        { role: "toolResult", content: [{ type: "text", text: "dynamic" }] },
+      ],
+    }, {})).rejects.toThrow(/Cache prefix contract violated/);
+    expect(originalStreamFn).toHaveBeenCalledTimes(1);
+  });
+
+  it("renews the cache prefix contract for an explicit model switch", async () => {
+    const sessionFile = path.join(tempDir, "hana", "sessions", "cache-contract-model-switch.jsonl");
+    const initialModel = {
+      id: "deepseek-v4-flash",
+      provider: "deepseek",
+      api: "openai-completions",
+      baseUrl: "https://api.deepseek.com",
+      contextWindow: 1000000,
+      maxTokens: 32000,
+    };
+    const nextModel = { ...initialModel, id: "deepseek-v4-pro" };
+    const readTool = { name: "read", description: "Read files", parameters: { type: "object" } };
+    const originalStreamFn = vi.fn(async () => "ok");
+    const session = {
+      sessionManager: { getSessionFile: () => sessionFile },
+      subscribe: vi.fn(() => vi.fn()),
+      model: initialModel,
+      getContextUsage: () => ({ tokens: 0 }),
+      setActiveToolsByName: vi.fn((names) => {
+        session.agent.state.tools = names.includes("read") ? [readTool] : [];
+      }),
+      setModel: vi.fn(async (model) => {
+        session.model = model;
+        session.agent.state.model = model;
+      }),
+      setThinkingLevel: vi.fn(),
+      agent: {
+        streamFn: originalStreamFn,
+        state: {
+          model: initialModel,
+          systemPrompt: "FINAL CACHE PREFIX",
+          tools: [readTool],
+          messages: [],
+        },
+      },
+    };
+    createAgentSessionMock.mockResolvedValue({ session });
+
+    const agent = {
+      id: "hana",
+      agentDir: tempDir,
+      sessionDir: tempDir,
+      sessionMemoryEnabled: true,
+      setMemoryEnabled: vi.fn(),
+      buildSystemPrompt: () => "FROZEN BASE",
+      getToolsSnapshot: () => [],
+      config: { tools: {} },
+      tools: [],
+    };
+    const coordinator = new SessionCoordinator({
+      agentsDir: tempDir,
+      getAgent: () => agent,
+      getActiveAgentId: () => "hana",
+      getModels: () => ({
+        currentModel: initialModel,
+        availableModels: [initialModel, nextModel],
+        authStorage: {},
+        modelRegistry: {},
+        resolveThinkingLevel: (level) => level,
+      }),
+      getResourceLoader: () => ({
+        getSystemPrompt: () => "BASE",
+        getAppendSystemPrompt: () => [],
+        getExtensions: () => ({ extensions: [], errors: [] }),
+      }),
+      getSkills: () => null,
+      buildTools: () => ({ tools: [readTool], customTools: [] }),
+      emitEvent: () => {},
+      getHomeCwd: () => "/tmp/home",
+      agentIdFromSessionPath: () => "hana",
+      switchAgentOnly: async () => {},
+      getConfig: () => ({}),
+      getPrefs: () => ({ getThinkingLevel: () => "medium" }),
+      getAgents: () => new Map(),
+      getActivityStore: () => null,
+      getAgentById: () => agent,
+      listAgents: () => [],
+    });
+
+    await coordinator.createSession(null, "/tmp/workspace", true);
+    await coordinator.switchSessionModel(sessionFile, nextModel);
+
+    await expect(session.agent.streamFn(nextModel, {
+      systemPrompt: "FINAL CACHE PREFIX",
+      tools: [readTool],
+      messages: [{ role: "user", content: "hello" }],
+    }, {})).resolves.toBe("ok");
   });
 
   it("cleans up the temporary session file when aborted after session creation", async () => {
@@ -1940,6 +2294,77 @@ describe("SessionCoordinator", () => {
     expect(getPermissionMode).toEqual(expect.any(Function));
     expect(getPermissionMode()).toBe("operate");
     expect(getPermissionMode(sessionFile)).toBe("operate");
+  });
+
+  it("executeIsolated appends execution-scoped custom tools", async () => {
+    const sessionFile = path.join(tempDir, "isolated-extra-tool.jsonl");
+    const buildTools = vi.fn((_cwd, customTools) => ({
+      tools: [],
+      customTools,
+    }));
+    const agent = {
+      id: "hana",
+      agentDir: path.join(tempDir, "agents", "hana"),
+      sessionDir: path.join(tempDir, "agents", "hana", "sessions"),
+      agentName: "hana",
+      memoryMasterEnabled: true,
+      config: {
+        models: { chat: { id: "default-model", provider: "test" } },
+        desk: { patrol_tools: [] },
+      },
+      systemPrompt: "BACKGROUND PROMPT",
+      tools: [{ name: "write" }],
+    };
+    const scopedTool = { name: "jian_update_status", execute: vi.fn() };
+
+    sessionManagerCreateMock.mockReturnValue({
+      getCwd: () => tempDir,
+      getSessionFile: () => sessionFile,
+    });
+    createAgentSessionMock.mockResolvedValue({
+      session: {
+        sessionManager: { getSessionFile: () => sessionFile },
+        subscribe: vi.fn(() => vi.fn()),
+        prompt: vi.fn(async () => {}),
+        abort: vi.fn(),
+      },
+    });
+
+    const coordinator = new SessionCoordinator({
+      agentsDir: path.join(tempDir, "agents"),
+      getAgent: () => agent,
+      getActiveAgentId: () => "hana",
+      getModels: () => ({
+        authStorage: {},
+        modelRegistry: {},
+        defaultModel: { id: "default-model", provider: "test" },
+        availableModels: [{ id: "default-model", provider: "test" }],
+        resolveExecutionModel: (model) => model,
+        resolveThinkingLevel: () => "medium",
+      }),
+      getResourceLoader: () => ({ getSystemPrompt: () => "prompt", getAppendSystemPrompt: () => [] }),
+      getSkills: () => ({ getSkillsForAgent: () => [] }),
+      buildTools,
+      emitEvent: () => {},
+      getHomeCwd: () => tempDir,
+      agentIdFromSessionPath: () => null,
+      switchAgentOnly: async () => {},
+      getConfig: () => ({}),
+      getPrefs: () => ({ getThinkingLevel: () => "medium" }),
+      getAgents: () => new Map(),
+      getActivityStore: () => null,
+      getAgentById: () => agent,
+      ensureAgentRuntime: async () => agent,
+      listAgents: () => [],
+    });
+
+    const result = await coordinator.executeIsolated("background check", {
+      activityType: "heartbeat",
+      extraCustomTools: [scopedTool],
+    });
+
+    expect(result.error).toBeNull();
+    expect(createAgentSessionMock.mock.calls[0][0].customTools.map((tool) => tool.name)).toEqual(["jian_update_status"]);
   });
 
   it("executeIsolated builds sandboxed tools against the inherited execution cwd", async () => {
@@ -2549,5 +2974,71 @@ describe("SessionCoordinator", () => {
 
     const sessions = await coordinator.listSessions();
     expect(sessions.find((s) => s.path === subagentPath)).toBeUndefined();
+  });
+
+  it("discardSessionRuntime clears live and hibernated entries plus focus state", async () => {
+    const agent = {
+      id: "hana",
+      agentName: "小花",
+      sessionDir: path.join(tempDir, "agents", "hana", "sessions"),
+      _memoryTicker: { notifySessionEnd: vi.fn(async () => undefined) },
+    };
+    const livePath = path.join(agent.sessionDir, "live.jsonl");
+    const hibernatedPath = path.join(agent.sessionDir, "hibernated.jsonl");
+    fs.mkdirSync(agent.sessionDir, { recursive: true });
+
+    const session = {
+      isStreaming: false,
+      dispose: vi.fn(),
+      sessionManager: { getSessionFile: () => livePath },
+    };
+    const unsub = vi.fn();
+    const confirmStore = { abortBySession: vi.fn() };
+    const deferredStore = { clearBySession: vi.fn() };
+    const closeTerminalsForSession = vi.fn();
+    const coordinator = new SessionCoordinator({
+      agentsDir: path.join(tempDir, "agents"),
+      getAgent: () => agent,
+      getActiveAgentId: () => "hana",
+      getModels: () => ({ authStorage: {}, modelRegistry: {}, resolveThinkingLevel: () => "medium" }),
+      getResourceLoader: () => ({ getSystemPrompt: () => "BASE" }),
+      getSkills: () => null,
+      buildTools: () => ({ tools: [], customTools: [] }),
+      emitEvent: () => {},
+      getHomeCwd: () => "/tmp/home",
+      agentIdFromSessionPath: () => "hana",
+      switchAgentOnly: async () => {},
+      getConfig: () => ({}),
+      getPrefs: () => ({ getThinkingLevel: () => "medium" }),
+      getAgents: () => new Map(),
+      getActivityStore: () => null,
+      getAgentById: () => agent,
+      listAgents: () => [{ id: "hana", name: "小花" }],
+      getConfirmStore: () => confirmStore,
+      getDeferredResultStore: () => deferredStore,
+      closeTerminalsForSession,
+    });
+
+    coordinator._sessions.set(livePath, { session, agentId: "hana", unsub });
+    coordinator._hibernatedSessionMeta.set(hibernatedPath, { agentId: "hana" });
+    coordinator._session = session;
+    coordinator._currentSessionPath = livePath;
+    coordinator._sessionStarted = true;
+
+    await expect(coordinator.discardSessionRuntime(livePath, "archive")).resolves.toBe(true);
+    await expect(coordinator.discardSessionRuntime(hibernatedPath, "archive")).resolves.toBe(true);
+
+    expect(coordinator._sessions.has(livePath)).toBe(false);
+    expect(coordinator._hibernatedSessionMeta.has(hibernatedPath)).toBe(false);
+    expect(coordinator.currentSessionPath).toBe(null);
+    expect(coordinator._sessionStarted).toBe(false);
+    expect(unsub).toHaveBeenCalledTimes(1);
+    expect(session.dispose).toHaveBeenCalledTimes(1);
+    expect(confirmStore.abortBySession).toHaveBeenCalledWith(livePath);
+    expect(confirmStore.abortBySession).toHaveBeenCalledWith(hibernatedPath);
+    expect(deferredStore.clearBySession).toHaveBeenCalledWith(livePath);
+    expect(deferredStore.clearBySession).toHaveBeenCalledWith(hibernatedPath);
+    expect(closeTerminalsForSession).toHaveBeenCalledWith(livePath);
+    expect(closeTerminalsForSession).toHaveBeenCalledWith(hibernatedPath);
   });
 });

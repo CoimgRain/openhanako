@@ -8,10 +8,11 @@ import { Hono } from "hono";
 import { MoodParser, ThinkTagParser, CardParser } from "../../core/events.js";
 import { extractBlocks } from "../block-extractors.js";
 import { toAppEventWsMessage } from "../app-events.js";
-import { wsSend, wsParse } from "../ws-protocol.js";
-import { debugLog } from "../../lib/debug-log.js";
+import { wsSend, wsParse, wsSendSerialized } from "../ws-protocol.js";
+import { debugLog, createModuleLogger } from "../../lib/debug-log.js";
 import { t } from "../i18n.js";
 import { getLastAssistantUsage } from "../../lib/pi-sdk/index.js";
+import { compactSessionWithCachePreservation, isStaleExtensionContextError } from "../../core/session-compactor.js";
 import { logLlmUsage } from "../../lib/llm/usage-observer.js";
 import { BrowserManager } from "../../lib/browser/browser-manager.js";
 import {
@@ -37,6 +38,9 @@ import {
   wsClientCanSendMessage,
 } from "../ws-scope.js";
 import { isSubagentSessionPath } from "../../core/message-utils.js";
+
+const log = createModuleLogger("chat");
+const wsLog = createModuleLogger("ws");
 
 /** tool_start 事件只广播这些 arg 字段，避免传输完整文件内容（同步维护：chat-render-shim.ts extractToolDetail） */
 const TOOL_ARG_SUMMARY_KEYS = ["file_path", "path", "command", "pattern", "url", "query", "key", "value", "action", "type", "schedule", "prompt", "label"];
@@ -84,11 +88,11 @@ function deferredResultFileBlocks(result) {
   if (!result || typeof result !== "object" || Array.isArray(result)) return [];
   const sessionFiles = Array.isArray(result.sessionFiles) ? result.sessionFiles : [];
   return sessionFiles
-    .map(sessionFileToContentBlock)
+    .map((file) => sessionFileToContentBlock(file, taskId ? { replacesTaskId: taskId } : undefined))
     .filter(Boolean);
 }
 
-function sessionFileToContentBlock(file) {
+function sessionFileToContentBlock(file, extra = undefined) {
   if (!file || typeof file !== "object") return null;
   const filePath = file.filePath || file.realPath || null;
   if (!filePath) return null;
@@ -97,6 +101,7 @@ function sessionFileToContentBlock(file) {
   const ext = file.ext ?? path.extname(filePath || label).toLowerCase().replace(/^\./, "");
   return {
     type: "file",
+    ...(extra || {}),
     ...(fileId ? { fileId } : {}),
     filePath,
     label,
@@ -106,6 +111,24 @@ function sessionFileToContentBlock(file) {
     ...(file.storageKind ? { storageKind: file.storageKind } : {}),
     ...(file.status ? { status: file.status } : {}),
     ...(file.missingAt !== undefined ? { missingAt: file.missingAt } : {}),
+    ...(file.mtimeMs !== undefined ? { mtimeMs: file.mtimeMs } : {}),
+    ...(file.size !== undefined ? { size: file.size } : {}),
+    ...(file.version ? { version: file.version } : {}),
+    ...(file.resource ? { resource: file.resource } : {}),
+  };
+}
+
+function deferredResultFailureBlock(event) {
+  const metaType = event?.meta?.type || "";
+  const mediaKind = event?.meta?.mediaKind || (metaType === "video-generation" ? "video" : (metaType === "image-generation" ? "image" : null));
+  if (!mediaKind || !event?.taskId) return null;
+  return {
+    type: "media_generation",
+    taskId: event.taskId,
+    kind: mediaKind,
+    status: event.status === "aborted" ? "aborted" : "failed",
+    ...(event.reason ? { reason: event.reason } : {}),
+    ...(event.meta?.prompt ? { prompt: event.meta.prompt } : {}),
   };
 }
 
@@ -133,13 +156,22 @@ export function toCompactionLifecycleWsMessage(event, sessionPath, getSessionByP
   };
 }
 
+export const DEFAULT_DISCONNECT_ABORT_GRACE_MS = 5 * 60_000;
+
+export function resolveDisconnectAbortGraceMs(value = process.env.HANA_WS_DISCONNECT_ABORT_GRACE_MS) {
+  if (value === undefined || value === null || value === "") return DEFAULT_DISCONNECT_ABORT_GRACE_MS;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) return DEFAULT_DISCONNECT_ABORT_GRACE_MS;
+  return Math.floor(parsed);
+}
+
 export function createChatRoute(engine, hub, { upgradeWebSocket }) {
   const restRoute = new Hono();
   const wsRoute = new Hono();
 
   let activeWsClients = 0;
   let disconnectAbortTimer = null;
-  const DISCONNECT_ABORT_GRACE_MS = 15_000;
+  const disconnectAbortGraceMs = resolveDisconnectAbortGraceMs();
   const sessionState = new Map(); // sessionPath -> shared stream state
 
   function cancelDisconnectAbort() {
@@ -151,15 +183,17 @@ export function createChatRoute(engine, hub, { upgradeWebSocket }) {
 
   function scheduleDisconnectAbort() {
     if (disconnectAbortTimer || activeWsClients > 0) return;
+    if (disconnectAbortGraceMs === 0) return;
     disconnectAbortTimer = setTimeout(() => {
       disconnectAbortTimer = null;
       if (activeWsClients > 0) return;
 
       // 中断所有正在 streaming 的 owner session（焦点 + 后台）
       for (const [, ss] of sessionState) ss.isAborted = true;
-      debugLog()?.log("ws", `no clients for ${DISCONNECT_ABORT_GRACE_MS}ms, aborting all streaming`);
+      debugLog()?.log("ws", `no clients for ${disconnectAbortGraceMs}ms, aborting all streaming`);
       engine.abortAllStreaming().catch(() => {});
-    }, DISCONNECT_ABORT_GRACE_MS);
+    }, disconnectAbortGraceMs);
+    disconnectAbortTimer.unref?.();
   }
 
   const MAX_SESSION_STATES = 100;
@@ -254,8 +288,15 @@ export function createChatRoute(engine, hub, { upgradeWebSocket }) {
 
   function broadcast(msg) {
     const hardenedMsg = hardenStudio(msg);
+    // 同一条消息发给 N 个 client 时只序列化一次。lazy：没有任何 client
+    // 能收到时连 JSON.stringify 都省掉。
+    let serialized = null;
     for (const [clientWs, client] of clients) {
-      if (wsClientCanReceiveEvent(client, hardenedMsg)) wsSend(clientWs, hardenedMsg);
+      if (clientWs.readyState !== 1) continue; // OPEN
+      if (wsClientCanReceiveEvent(client, hardenedMsg)) {
+        if (serialized === null) serialized = JSON.stringify(hardenedMsg);
+        wsSendSerialized(clientWs, serialized);
+      }
     }
   }
 
@@ -328,7 +369,7 @@ export function createChatRoute(engine, hub, { upgradeWebSocket }) {
       if (!ok) ss.titleRequested = false;
     }).catch((err) => {
       ss.titleRequested = false;
-      console.error("[chat] generateSessionTitle error:", err.message);
+      log.error(`generateSessionTitle error: ${err.message}`);
     });
   }
 
@@ -462,7 +503,11 @@ export function createChatRoute(engine, hub, { upgradeWebSocket }) {
       });
 
       // Unified content_block emission for all tool results
-      const blocks = extractBlocks(event.toolName, event.result?.details, event.result);
+      const blocks = enrichSessionFileBlocks(
+        extractBlocks(event.toolName, event.result?.details, event.result),
+        engine,
+        sessionPath,
+      );
       for (const block of blocks) {
         emitStreamEvent(sessionPath, ss, { type: "content_block", block });
       }
@@ -745,9 +790,12 @@ export function createChatRoute(engine, hub, { upgradeWebSocket }) {
         meta: event.meta,
       });
       if (event.status === "success") {
-        for (const block of deferredResultFileBlocks(event.result)) {
+        for (const block of enrichSessionFileBlocks(deferredResultFileBlocks(event.result, event.taskId), engine, sessionPath)) {
           emitStreamEvent(sessionPath, ss, { type: "content_block", block });
         }
+      } else {
+        const block = deferredResultFailureBlock(event);
+        if (block) emitStreamEvent(sessionPath, ss, { type: "content_block", block });
       }
     }
   });
@@ -909,7 +957,7 @@ export function createChatRoute(engine, hub, { upgradeWebSocket }) {
 
             if (msg.type === "compact") {
               const compactPath = requireSessionPath(msg, ws); if (!compactPath) return;
-              const session = engine.getSessionByPath(compactPath)
+              let session = engine.getSessionByPath(compactPath)
                 || await engine.ensureSessionLoaded?.(compactPath);
               if (!session) {
                 wsSend(ws, { type: "error", message: t("error.noActiveSession"), sessionPath: compactPath });
@@ -924,7 +972,14 @@ export function createChatRoute(engine, hub, { upgradeWebSocket }) {
                 return;
               }
               try {
-                await session.compact();
+                try {
+                  await compactSessionWithCachePreservation(session);
+                } catch (err) {
+                  if (!isStaleExtensionContextError(err)) throw err;
+                  session = await engine.reloadSessionRuntime?.(compactPath);
+                  if (!session) throw err;
+                  await compactSessionWithCachePreservation(session);
+                }
               } catch (err) {
                 const errMsg = err.message || "";
                 if (!errMsg.includes("Already compacted") && !errMsg.includes("Nothing to compact")) {
@@ -1034,7 +1089,7 @@ export function createChatRoute(engine, hub, { upgradeWebSocket }) {
 
         onError(event, ws) {
           const err = event.error || event;
-          console.error("[ws] error:", err.message || err);
+          wsLog.error(`error: ${err.message || err}`);
           debugLog()?.error("ws", err.message || String(err));
         },
 
@@ -1058,6 +1113,53 @@ export function createChatRoute(engine, hub, { upgradeWebSocket }) {
   );
 
   return { restRoute, wsRoute };
+}
+
+function enrichSessionFileBlocks(blocks, engine, sessionPath) {
+  if (!Array.isArray(blocks) || blocks.length === 0 || !sessionPath) return blocks || [];
+  return blocks.map((block) => {
+    const patch = sessionFileBlockPatch(block, engine, sessionPath);
+    if (!patch) return block;
+    const next = { ...block, ...patch };
+    if (next.type === "skill" && next.installedFile) {
+      next.installedFile = { ...next.installedFile, ...patch };
+    }
+    return next;
+  });
+}
+
+function sessionFileBlockPatch(block, engine, sessionPath) {
+  if (!block || typeof block !== "object") return null;
+  if (!["file", "artifact", "skill"].includes(block.type)) return null;
+  let file = null;
+  if (block.fileId && typeof engine?.getSessionFile === "function") {
+    file = engine.getSessionFile(block.fileId, { sessionPath });
+  }
+  if (!file && block.filePath && typeof engine?.getSessionFileByPath === "function") {
+    file = engine.getSessionFileByPath(block.filePath, { sessionPath });
+  }
+  if (!file) return null;
+  const serialized = typeof engine?.serializeSessionFile === "function"
+    ? engine.serializeSessionFile(file)
+    : file;
+  return sessionFileFields(serialized || file);
+}
+
+function sessionFileFields(file) {
+  if (!file || typeof file !== "object") return null;
+  const fileId = file.fileId || file.id || null;
+  return {
+    ...(fileId ? { fileId } : {}),
+    ...(file.filePath ? { filePath: file.filePath } : {}),
+    ...(file.label || file.displayName || file.filename ? { label: file.label || file.displayName || file.filename } : {}),
+    ...(file.ext !== undefined ? { ext: file.ext } : {}),
+    ...(file.mime ? { mime: file.mime } : {}),
+    ...(file.kind ? { kind: file.kind } : {}),
+    ...(file.storageKind ? { storageKind: file.storageKind } : {}),
+    ...(file.status ? { status: file.status } : {}),
+    ...(file.missingAt !== undefined ? { missingAt: file.missingAt } : {}),
+    ...(file.resource ? { resource: file.resource } : {}),
+  };
 }
 
 /**
@@ -1092,7 +1194,7 @@ async function generateSessionTitle(engine, notify, opts = {}) {
       const fallback = userText.replace(/\n/g, " ").trim().slice(0, 30);
       if (!fallback) return;
       title = fallback;
-      console.log("[chat] session 标题 API 失败，使用 fallback:", title);
+      log.log(`session 标题 API 失败，使用 fallback: ${title}`);
     }
 
     // 保存标题
@@ -1102,7 +1204,7 @@ async function generateSessionTitle(engine, notify, opts = {}) {
     notify({ type: "session_title", title, path: sessionPath });
     return true;
   } catch (err) {
-    console.error("[chat] 生成 session 标题失败:", err.message);
+    log.error(`生成 session 标题失败: ${err.message}`);
     return false;
   }
 }

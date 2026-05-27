@@ -1,5 +1,9 @@
 import { describe, it, expect } from 'vitest';
-import { BLOCK_EXTRACTORS, extractBlocks } from '../server/block-extractors.js';
+import {
+  BLOCK_EXTRACTORS,
+  extractBlocks,
+  resolveMediaGenerationBlocks,
+} from '../server/block-extractors.js';
 
 // ─── stage_files ─────────────────────────────────────────────────────────────
 
@@ -79,6 +83,39 @@ describe('stage_files', () => {
     });
   });
 
+  it('preserves session file resource envelopes for remote clients', () => {
+    const resource = {
+      schemaVersion: 1,
+      resourceId: 'res_sf_remote',
+      name: 'studios/studio_1/resources/res_sf_remote',
+      studioId: 'studio_1',
+      type: 'file',
+      source: 'session_file',
+      fileId: 'sf_remote',
+      lifecycle: { status: 'available', missingAt: null },
+      storage: { provider: 'session_file', localOnly: true },
+      links: {
+        self: '/api/resources/res_sf_remote',
+        content: '/api/resources/res_sf_remote/content',
+      },
+    };
+    const result = extractor({
+      files: [{
+        fileId: 'sf_remote',
+        filePath: '/a/generated.png',
+        label: 'generated.png',
+        ext: 'png',
+        resource,
+      }],
+    });
+
+    expect(result[0]).toMatchObject({
+      type: 'file',
+      fileId: 'sf_remote',
+      resource,
+    });
+  });
+
   it('empty details: returns empty array', () => {
     const result = extractor({});
     expect(result).toEqual([]);
@@ -95,6 +132,126 @@ describe('present_files', () => {
   it('produces identical output to stage_files', () => {
     const details = { filePath: '/a/x.py', label: 'x', ext: 'py' };
     expect(BLOCK_EXTRACTORS.present_files(details)).toEqual(BLOCK_EXTRACTORS.stage_files(details));
+  });
+});
+
+// ─── image-gen media generation ─────────────────────────────────────────────
+
+describe('image-gen media generation', () => {
+  it('extracts one pending media_generation block per submitted image task', () => {
+    const blocks = extractBlocks('image-gen_generate-image', {
+      mediaGeneration: {
+        kind: 'image',
+        batchId: 'batch-1',
+        prompt: 'A small moonlit room',
+        tasks: [
+          { taskId: 'task-a' },
+          { taskId: 'task-b' },
+        ],
+      },
+    });
+
+    expect(blocks).toEqual([
+      {
+        type: 'media_generation',
+        taskId: 'task-a',
+        kind: 'image',
+        batchId: 'batch-1',
+        prompt: 'A small moonlit room',
+        status: 'pending',
+      },
+      {
+        type: 'media_generation',
+        taskId: 'task-b',
+        kind: 'image',
+        batchId: 'batch-1',
+        prompt: 'A small moonlit room',
+        status: 'pending',
+      },
+    ]);
+  });
+
+  it('replaces historical pending media_generation blocks with completed session file blocks', () => {
+    const blocks = [{
+      type: 'media_generation',
+      afterIndex: 4,
+      taskId: 'task-a',
+      kind: 'image',
+      status: 'pending',
+    }];
+    const results = new Map([[
+      'task-a',
+      {
+        status: 'success',
+        result: {
+          sessionFiles: [{
+            fileId: 'sf_img',
+            filePath: '/tmp/generated.png',
+            label: 'generated.png',
+            ext: 'png',
+            mime: 'image/png',
+            kind: 'image',
+          }],
+        },
+      },
+    ]]);
+
+    expect(resolveMediaGenerationBlocks(blocks, results)).toEqual([{
+      type: 'file',
+      afterIndex: 4,
+      replacesTaskId: 'task-a',
+      fileId: 'sf_img',
+      filePath: '/tmp/generated.png',
+      label: 'generated.png',
+      ext: 'png',
+      mime: 'image/png',
+      kind: 'image',
+    }]);
+  });
+
+  it('preserves resource links when replacing completed media generation files', () => {
+    const resource = {
+      schemaVersion: 1,
+      resourceId: 'res_sf_img',
+      name: 'studios/studio_1/resources/res_sf_img',
+      studioId: 'studio_1',
+      type: 'file',
+      source: 'session_file',
+      fileId: 'sf_img',
+      lifecycle: { status: 'available', missingAt: null },
+      storage: { provider: 'session_file', localOnly: true },
+      links: {
+        self: '/api/resources/res_sf_img',
+        content: '/api/resources/res_sf_img/content',
+      },
+    };
+    const blocks = [{
+      type: 'media_generation',
+      taskId: 'task-a',
+      kind: 'image',
+      status: 'pending',
+    }];
+    const results = new Map([[
+      'task-a',
+      {
+        status: 'success',
+        result: {
+          sessionFiles: [{
+            fileId: 'sf_img',
+            filePath: '/tmp/generated.png',
+            label: 'generated.png',
+            ext: 'png',
+            resource,
+          }],
+        },
+      },
+    ]]);
+
+    expect(resolveMediaGenerationBlocks(blocks, results)[0]).toMatchObject({
+      type: 'file',
+      fileId: 'sf_img',
+      resource,
+    });
   });
 });
 
@@ -339,6 +496,26 @@ describe('cron', () => {
 
 describe('update_settings', () => {
   const extractor = BLOCK_EXTRACTORS.update_settings;
+
+  it('with settingsUpdate details: returns settings_update block', () => {
+    const settingsUpdate = {
+      status: 'applied',
+      action: 'core.apply',
+      key: 'locale',
+      title: 'Locale updated',
+      summary: 'Locale changed.',
+      changes: [
+        { key: 'locale', label: 'Locale', before: 'zh-CN', after: 'en' },
+      ],
+    };
+
+    expect(extractor({ settingsUpdate })).toEqual([
+      {
+        type: 'settings_update',
+        update: settingsUpdate,
+      },
+    ]);
+  });
 
   it('with settingKey and all fields: returns settings_confirm block', () => {
     const details = {

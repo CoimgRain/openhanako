@@ -7,7 +7,7 @@ import path from "node:path";
 
 export const name = "generate-video";
 export const description =
-  "根据文字描述生成视频。非阻塞：提交后立即返回，完成后自动通知。";
+  "根据文字描述生成视频。非阻塞：提交后立即返回，完成后自动显示。";
 
 export const parameters = {
   type: "object",
@@ -87,7 +87,13 @@ export async function execute(input, ctx) {
     await ctx.bus.request("deferred:register", {
       taskId: result.taskId,
       sessionPath: ctx.sessionPath,
-      meta: { type: "video-generation", prompt: input.prompt },
+      meta: {
+        type: "video-generation",
+        mediaKind: "video",
+        deliveryIntent: "ui_only",
+        triggerParentTurn: false,
+        prompt: input.prompt,
+      },
     });
   } catch (err) {
     ctx.log.warn(`deferred:register failed for ${result.taskId}:`, err);
@@ -109,12 +115,11 @@ export async function execute(input, ctx) {
   return {
     content: [{ type: "text", text: "已提交视频生成，完成后会自动显示在下方卡片中。" }],
     details: {
-      card: {
-        type: "iframe",
-        route: `/card?batch=${batchId}`,
-        title: "视频生成",
-        description: input.prompt.slice(0, 60),
-        aspectRatio: input.ratio || "16:9",
+      mediaGeneration: {
+        kind: "video",
+        batchId,
+        prompt: input.prompt,
+        tasks: [{ taskId: result.taskId }],
       },
     },
   };

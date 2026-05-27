@@ -172,4 +172,85 @@ describe('streamBufferManager.ensureMessage 自愈', () => {
     expect(last.data.id).toBe(assistantId);
     expect(last.data.blocks?.some((block: { type: string }) => block.type === 'tool_group')).toBe(true);
   });
+
+  it('deferred 文件结果按 taskId 原地替换 media_generation 占位块', () => {
+    streamBufferManager.handle({
+      type: 'content_block',
+      sessionPath: PATH,
+      block: {
+        type: 'media_generation',
+        taskId: 'task-img',
+        kind: 'image',
+        status: 'pending',
+        prompt: 'a moonlit room',
+      },
+    });
+
+    streamBufferManager.handle({
+      type: 'content_block',
+      sessionPath: PATH,
+      block: {
+        type: 'file',
+        replacesTaskId: 'task-img',
+        fileId: 'sf_img',
+        filePath: '/tmp/generated.png',
+        label: 'generated.png',
+        ext: 'png',
+        mime: 'image/png',
+        kind: 'image',
+      },
+    });
+
+    const assistant = getAssistantMessage();
+    expect(assistant?.blocks).toEqual([
+      expect.objectContaining({
+        type: 'file',
+        fileId: 'sf_img',
+        filePath: '/tmp/generated.png',
+      }),
+    ]);
+  });
+
+  it('deferred 文件结果在 turn 结束后仍按 taskId 替换上一条消息的占位块', () => {
+    streamBufferManager.handle({
+      type: 'content_block',
+      sessionPath: PATH,
+      block: {
+        type: 'media_generation',
+        taskId: 'task-late-img',
+        kind: 'image',
+        status: 'pending',
+        prompt: 'a late night room',
+      },
+    });
+    streamBufferManager.handle({ type: 'turn_end', sessionPath: PATH });
+
+    streamBufferManager.handle({
+      type: 'content_block',
+      sessionPath: PATH,
+      block: {
+        type: 'file',
+        replacesTaskId: 'task-late-img',
+        fileId: 'sf_late_img',
+        filePath: '/tmp/late-generated.png',
+        label: 'late-generated.png',
+        ext: 'png',
+        mime: 'image/png',
+        kind: 'image',
+      },
+    });
+
+    const assistantItems = getItems().filter((item) => item.type === 'message' && item.data.role === 'assistant');
+    expect(assistantItems).toHaveLength(1);
+    const assistant = assistantItems[0];
+    expect(assistant?.type).toBe('message');
+    if (assistant?.type !== 'message') throw new Error('expected assistant message');
+    expect(assistant.data.blocks).toEqual([
+      expect.objectContaining({
+        type: 'file',
+        fileId: 'sf_late_img',
+        filePath: '/tmp/late-generated.png',
+      }),
+    ]);
+  });
 });

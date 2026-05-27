@@ -31,6 +31,10 @@ export function switchTab(tab: TabType) {
   }
 
   s.setCurrentTab(tab);
+  if (tab === 'channels') {
+    hydrateCurrentChannelIfNeeded().catch((err: unknown) =>
+      console.warn('[channels] hydrate current channel failed', err));
+  }
   localStorage.setItem('hana-tab', tab);
 
   if (tab === 'channels') {

@@ -1,7 +1,7 @@
 /**
- * SkillManager — Skill 加载、过滤、per-agent 隔离
+ * SkillManager — Skill 加载、过滤、运行时同步
  *
- * 管理全量 skill 列表、learned skills 扫描、外部兼容技能扫描、per-agent 隔离过滤。
+ * 管理全量 skill 列表、外部兼容技能扫描、plugin/workspace 可见性过滤。
  * 从 Engine 提取，Engine 通过 manager 访问 skill 状态。
  */
 import fs from "fs";
@@ -9,6 +9,9 @@ import path from "path";
 import chokidar from "chokidar";
 import { parseSkillMetadata } from "../lib/skills/skill-metadata.js";
 import { sourceIdentityForSkill } from "../lib/skills/skill-file-identity.js";
+import { createModuleLogger } from "../lib/debug-log.js";
+
+const log = createModuleLogger("skill-manager");
 
 // 重型目录名：watcher 必须主动跳过，否则一个带 npm 依赖的 skill 就能撑爆 fd
 // 上限（macOS 默认 256），触发 EMFILE → 错误日志雪崩 → server OOM/SIGKILL。
@@ -91,7 +94,7 @@ export class SkillManager {
   get allSkills() { return this._allSkills; }
 
   /**
-   * 首次加载：从 resourceLoader 获取内置 skills + 合并所有 agent 的 learned skills + 外部技能
+   * 首次加载：从 resourceLoader 获取内置 / 用户 skills + 外部技能
    * @param {object} resourceLoader - Pi SDK DefaultResourceLoader 实例
    * @param {Map} agents - agent Map
    * @param {Set<string>} hiddenSkills - 需要隐藏的 skill name 集合
@@ -102,20 +105,14 @@ export class SkillManager {
     for (const s of this._allSkills) {
       decorateLoadedSkill(s, hiddenSkills);
     }
-    for (const [, ag] of agents) {
-      this._allSkills.push(...this.scanLearnedSkills(ag.agentDir));
-    }
     this._appendExternalSkills();
   }
 
   /**
-   * 按 agent 过滤 _allSkills：learned skill 只对归属 agent 可见。
-   * 所有对外消费方法都基于此方法，agentId 隔离逻辑只写这一处。
+   * 按消费场景过滤 _allSkills：普通列表隐藏 plugin / workspace，运行时列表包含它们。
    */
   _skillsVisibleToAgent(agent, { includePlugin = false, includeWorkspace = false } = {}) {
-    const agentId = agent?.id || null;
     return this._allSkills.filter(s => {
-      if (s._agentId && s._agentId !== agentId) return false;
       if (!includePlugin && s._pluginSkill) return false;
       if (!includeWorkspace && s._workspaceSkill) return false;
       return true;
@@ -124,6 +121,7 @@ export class SkillManager {
 
   /** 将 agent 启用的 skill 同步到 agent 的 system prompt */
   syncAgentSkills(agent) {
+    if (!agent || agent.runtimeInitialized === false || agent.needsRepair === true) return;
     const enabled = new Set(agent?.config?.skills?.enabled || []);
     const skills = this._skillsVisibleToAgent(agent, { includePlugin: true, includeWorkspace: true })
       .filter(s => this._isRuntimeEnabledForAgent(s, enabled));
@@ -179,13 +177,13 @@ export class SkillManager {
 
   /**
    * 计算新建 agent 的默认 enabled skill 集合:
-   * 所有 source 不是 learned 不是 external 的 skill 的 name。
+   * 所有 source 不是 external 且没有 opt-out 的全局 skill name。
    * plugin/workspace 通过 _isRuntimeEnabledForAgent 的 bypass 自动启用,
    * 不需要写入 enabled 数组。
    */
   computeDefaultEnabledForNewAgent() {
     return this._allSkills
-      .filter(s => s.source !== "learned" && s.source !== "external" && s.defaultEnabled !== false)
+      .filter(s => s.source !== "external" && s.defaultEnabled !== false)
       .map(s => s.name);
   }
 
@@ -202,9 +200,6 @@ export class SkillManager {
     this._allSkills = resourceLoader.getSkills().skills;
     for (const s of this._allSkills) {
       decorateLoadedSkill(s, this._hiddenSkills);
-    }
-    for (const [, ag] of agents) {
-      this._allSkills.push(...this.scanLearnedSkills(ag.agentDir));
     }
     this._appendExternalSkills();
   }
@@ -230,10 +225,10 @@ export class SkillManager {
         this._reloadTimer = setTimeout(() => this._autoReload(), 1000);
       });
       this._watcher.on("error", (err) => {
-        console.error("[skill-manager] watcher error:", err.message);
+        log.error(`watcher error: ${err.message}`);
       });
     } catch (err) {
-      console.error("[skill-manager] failed to create watcher:", err.message);
+      log.error(`failed to create watcher: ${err.message}`);
     }
     this._watchExternalPaths();
   }
@@ -245,7 +240,7 @@ export class SkillManager {
       await this.reload(deps.resourceLoader, deps.agents);
       deps.onReloaded?.();
     } catch (err) {
-      console.warn("[skill-manager] auto-reload failed:", err.message);
+      log.warn(`auto-reload failed: ${err.message}`);
     }
   }
 
@@ -356,11 +351,11 @@ export class SkillManager {
           this._reloadTimer = setTimeout(() => this._autoReload(), 1000);
         });
         w.on("error", (err) => {
-          console.error(`[skill-manager] external watcher error (${dirPath}):`, err.message);
+          log.error(`external watcher error (${dirPath}): ${err.message}`);
         });
         this._externalWatchers.set(dirPath, w);
       } catch (err) {
-        console.error(`[skill-manager] failed to watch external path (${dirPath}):`, err.message);
+        log.error(`failed to watch external path (${dirPath}): ${err.message}`);
       }
     }
   }
@@ -378,46 +373,5 @@ export class SkillManager {
       || skill?._workspaceSkill
       || enabledSet?.has(skill.name)
     );
-  }
-
-  // ── 自学技能扫描 ──
-
-  /**
-   * 扫描 agentDir/learned-skills/ 下的自学 skills
-   * @param {string} agentDir
-   */
-  scanLearnedSkills(agentDir) {
-    const agentId = path.basename(agentDir);
-    const learnedDir = path.join(agentDir, "learned-skills");
-    if (!fs.existsSync(learnedDir)) return [];
-    const results = [];
-    for (const entry of fs.readdirSync(learnedDir, { withFileTypes: true })) {
-      if (!entry.isDirectory()) continue;
-      const skillFile = path.join(learnedDir, entry.name, "SKILL.md");
-      if (!fs.existsSync(skillFile)) continue;
-      try {
-        const content = fs.readFileSync(skillFile, "utf-8");
-        const meta = parseSkillMetadata(content, entry.name);
-        const baseDir = path.join(learnedDir, entry.name);
-        results.push({
-          name: meta.name,
-          description: meta.description,
-          filePath: skillFile,
-          baseDir,
-          source: "learned",
-          disableModelInvocation: meta.disableModelInvocation,
-          defaultEnabled: meta.defaultEnabled,
-          _agentId: agentId,
-          _hidden: false,
-          sourceIdentity: sourceIdentityForSkill({
-            name: meta.name,
-            filePath: skillFile,
-            baseDir,
-            source: "learned",
-          }),
-        });
-      } catch {}
-    }
-    return results;
   }
 }

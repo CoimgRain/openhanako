@@ -8,6 +8,7 @@
     "dmHint": "僅顯示主助手的私聊",
     "groupLabel": "頻道",
     "noMessages": "暫無訊息",
+    "selectHint": "選擇一個頻道或私訊開始對話",
     "nameExists": "該頻道名已存在",
     "membersCount": "位成員",
     "info": "頻道資訊",
@@ -18,13 +19,13 @@
     "createTitle": "新建頻道",
     "createName": "頻道名稱",
     "createNamePlaceholder": "例如：design-team",
-    "createMembers": "成員",
+    "createMembers": "Agent 成員",
     "createIntro": "頻道介紹",
     "createIntroPlaceholder": "描述一下這個頻道的用途...",
     "createCancel": "取消",
     "createConfirm": "建立",
     "nameRequired": "請輸入頻道名稱",
-    "minMembers": "至少選擇 2 位成員",
+    "minMembers": "至少選擇 2 位 Agent 成員",
     "created": "頻道 #{name} 已建立 ✿",
     "createFailed": "建立失敗",
     "alreadyExists": "頻道已存在",
@@ -80,7 +81,18 @@
     "bridge": "接入社群平台",
     "toggle": "側邊欄",
     "bridgeShort": "接入",
-    "pinned": "置頂"
+    "pinned": "置頂",
+    "searchPlaceholder": "搜尋聊天記錄",
+    "searchClear": "清空搜尋",
+    "searchTitleMatches": "標題",
+    "searchContentMatches": "正文",
+    "searchingTitles": "正在搜尋標題…",
+    "searchingContent": "正在搜尋正文…",
+    "searchNoResults": "沒有找到相關會話",
+    "searchFailed": "搜尋失敗"
+  },
+  "titlebar": {
+    "currentChatTitle": "目前對話標題"
   },
   "session": {
     "untitled": "新對話",
@@ -150,8 +162,8 @@
     "selectAllMessages": "全選訊息",
     "screenshotInProgress": "正在截圖",
     "screenshotProgressPage": "正在截圖，第 {current}/{total} 頁",
-    "screenshotSaved": "截圖已儲存到工作目錄下的「截圖」資料夾",
-    "screenshotSavedMultiple": "截圖已分成 {count} 張儲存到工作目錄下的「截圖」資料夾",
+    "screenshotSaved": "截圖已儲存到工作目錄下的「OH-Works」資料夾",
+    "screenshotSavedMultiple": "截圖已分成 {count} 張儲存到工作目錄下的「OH-Works」資料夾",
     "screenshotFailed": "截圖儲存失敗",
     "selectedCount": "已選 {count} 則",
     "allDone": "全部完成",
@@ -236,7 +248,7 @@
   "slash": {
     "diary": "寫今日日記",
     "diaryBusy": "正在寫日記...",
-    "diaryDone": "日記寫入完成，已儲存到 diary 資料夾",
+    "diaryDone": "日記寫入完成，已儲存到 OH-Works 資料夾",
     "diaryFailed": "日記寫入失敗",
     "xing": "從對話中提煉技能",
     "compact": "壓縮上下文",
@@ -518,6 +530,11 @@
       "done": "🧭 分身出發了",
       "failed": "🧭 分身出了岔子"
     },
+    "wait": {
+      "running": "⏳ {name} 正在等待結果",
+      "done": "⏳ 等待結束",
+      "failed": "⏳ 等待被中斷"
+    },
     "check_pending_tasks": {
       "running": "📋 {name} 正在找找沒做完的事兒",
       "done": "📋 {name} 找完了",
@@ -589,7 +606,8 @@
       "Ta 把散落的情緒重新收好",
       "{name} 聞到了某個下午的橘子味",
       "那些對話還帶著體溫"
-    ]
+    ],
+    "installing": "{name} 正在更新到 v{version}，請稍候……"
   },
   "settings": {
     "title": "設定",
@@ -605,6 +623,7 @@
       "agent": "助手",
       "me": "我",
       "providers": "供應商",
+      "media": "多媒體",
       "models": "模型",
       "memory": "記憶",
       "work": "工作台",
@@ -682,7 +701,7 @@
     "editor": {
       "title": "編輯器",
       "markdownBodyFontSize": "正文字號",
-      "markdownBodyFontSizeHint": "Markdown 編輯器正文預設使用接近 Notion 的 16px。",
+      "markdownBodyFontSizeHint": "Markdown 編輯器正文預設使用 15px。",
       "markdownHeading1FontSize": "一級標題字號",
       "markdownHeading1FontSizeHint": "用於 # 標題。",
       "markdownHeading2FontSize": "二級標題字號",
@@ -723,6 +742,8 @@
       "chatModelHint": "Ta 在對話與工作中使用的模型",
       "modelUnavailable": "目前不可用：{model}",
       "modelUnavailableHint": "目前模型已不在可用列表中，請重新選擇模型，或到供應商頁面重新儲存設定並讀取模型。",
+      "imageModel": "圖片模型",
+      "imageModelHint": "Ta 在圖片生成時使用的模型",
       "addAgent": "新建助手",
       "createTitle": "新建助手",
       "namePlaceholder": "起個名字",
@@ -744,7 +765,8 @@
       "deleteCancel": "取消",
       "deleted": "{name} 已刪除",
       "deleteFailed": "刪除失敗",
-      "setActive": "設為主助手",
+      "setPrimary": "設為主助手",
+      "setPrimaryFailed": "設定主助手失敗",
       "lastAgent": "至少保留一個助手",
       "yuan": "元",
       "yuanHint": "「元」是助手的潛意識，以此為基礎搭建你獨一無二的夥伴",
@@ -752,6 +774,8 @@
         "title": "工具",
         "description": "這些工具開關會在重啟對話或建立新對話後生效。目前進行中的會話會繼續使用建立時的工具集。",
         "items": {
+          "automation": { "label": "自動化", "summary": "讓 Agent 建立通知和外掛定時動作" },
+          "beautify": { "label": "小花美术", "summary": "讓 Agent 為文件生成封面和審美增強內容" },
           "browser": { "label": "瀏覽器", "summary": "控制無頭瀏覽器瀏覽網頁" },
           "computer": { "label": "電腦控制", "summary": "控制已批准的桌面應用，並顯示即時動作游標" },
           "cron": { "label": "定時任務", "summary": "在指定時間自動執行任務" },
@@ -785,14 +809,15 @@
       "updateChecking": "正在檢查更新…",
       "updateDownloading": "{agentName}正在準備新家 {percent}%",
       "updateReadyInstall": "v{version} 已就緒",
-      "updateInstalling": "正在安裝更新，Hanako 會自動重新啟動…",
+      "updateInstalling": "正在安裝更新，HanaAgent 會自動重新啟動…",
       "updateInstallManualHint": "點「重啟更新」後安裝，直接退出不會自動安裝",
       "updateInstall": "重新啟動更新",
+      "updateInstallNow": "重新啟動立即更新",
       "updateProgress": "{percent}%",
       "updateError": "檢查更新失敗",
       "updateLatest": "已是最新版本",
       "updateCheckBtn": "檢查更新",
-      "updateNeedInstall": "請先將 Hanako 移動到應用程式資料夾",
+      "updateNeedInstall": "請先將 HanaAgent 移動到應用程式資料夾",
       "updateDiskSpace": "磁碟空間不足，無法下載更新",
       "launchAtLogin": "開機自啟",
       "betaUpdates": "接收測試版更新",
@@ -803,7 +828,7 @@
       "mobileAccess": "手機存取",
       "desktopAccess": "電腦存取",
       "lanToggle": "允許區域網路裝置存取",
-      "lanHint": "開啟後，同一區域網路內的手機和電腦可以存取這台 Hana Server",
+      "lanHint": "開啟後，同一區域網路內的手機和電腦可以存取這台 HanaAgent Server",
       "port": "固定連接埠",
       "portHint": "用於書籤和 QR Code；修改後需要重新啟動 Hana 生效",
       "mobileUrl": "手機存取地址",
@@ -838,7 +863,7 @@
       "desktopKeyFailed": "產生失敗",
       "connectLanServer": "連線區域網路伺服器",
       "remoteServerUrl": "伺服器位址",
-      "remoteServerUrlHint": "填入另一台電腦或 NAS 上 Hana Server 的地址",
+      "remoteServerUrlHint": "填入另一台電腦或 NAS 上 HanaAgent Server 的地址",
       "remoteServerKey": "存取密鑰",
       "remoteServerKeyHint": "填入那台伺服器設定頁產生的電腦存取密鑰",
       "remoteServerConnected": "已連線區域網路伺服器",
@@ -878,6 +903,7 @@
       "sandboxNetwork": "允許沙盒聯網",
       "sandboxNetworkDesc": "開啟後，沙盒內的命令可以存取公網；檔案寫入限制仍然生效",
       "sandboxNetworkDisabledDesc": "沙盒關閉時命令已按普通行程聯網，這個開關只影響開啟沙盒後的命令",
+      "sandboxNetworkWin32Unsupported": "Windows 命令沙盒只隔離檔案寫入，暫不支援網路隔離；沙盒命令會按目前使用者網路權限執行",
       "networkProxy": "出站代理",
       "networkProxyMode": "代理模式",
       "networkProxyModeDesc": "應用內 API、OAuth、Bridge 和網頁請求共用這組出站代理",
@@ -892,6 +918,9 @@
       "networkProxyWss": "WSS proxy，可留空",
       "networkProxyNoProxy": "不走代理，例如 localhost, 127.0.0.1, ::1",
       "networkProxySave": "儲存代理設定",
+      "archivedChats": "歸檔對話",
+      "archivedChatsDesc": "查看已歸檔的聊天，還原需要繼續的對話，或永久刪除不再需要的紀錄",
+      "viewArchivedChats": "查看歸檔對話",
       "fileBackup": "檔案備份",
       "fileBackupDesc": "AI 修改或刪除檔案前自動儲存原始內容",
       "retention": "保留時間",
@@ -958,6 +987,72 @@
       "remove": "移除",
       "deleteConfirm": "確定刪除供應商 {name}？相關模型將一併清除。"
     },
+    "usage": {
+      "title": "用量統計",
+      "note": "用量僅供參考，具體以供應商的統計為準。",
+      "refresh": "重新整理用量",
+      "total": "全部",
+      "requests": "請求數",
+      "totalTokens": "Tokens",
+      "cacheRead": "快取命中",
+      "cacheHitRate": "命中率",
+      "estimatedCost": "預估成本",
+      "uncached": "未快取消耗",
+      "modelMix": "模型分佈",
+      "dailyUsage": "每日用量",
+      "requestLedger": "請求明細",
+      "loading": "正在讀取用量…",
+      "empty": "暫無用量記錄",
+      "groupMeta": "{requests} 次 · {errors} 錯誤",
+      "cacheShort": "快取 {tokens}",
+      "tokensShort": "{tokens} tok",
+      "cacheSummary": "快取 {cache} · 未快取 {uncached}",
+      "view": {
+        "overall": "總覽",
+        "daily": "按日期",
+        "category": "按類別",
+        "model": "按模型"
+      },
+      "category": {
+        "session": "Session",
+        "phone": "Phone",
+        "memory": "記憶",
+        "automation": "自動化",
+        "subagent": "Subagent",
+        "compaction": "壓縮",
+        "plugin": "外掛",
+        "utility": "工具",
+        "vision": "視覺",
+        "unknown": "未知"
+      },
+      "status": {
+        "ok": "完成",
+        "error": "錯誤",
+        "aborted": "中止",
+        "usage_missing": "無用量"
+      }
+    },
+    "media": {
+      "imageGeneration": "圖片生成",
+      "defaultModel": "預設圖片模型",
+      "credentialOk": "API Key 已設定（複用供應商設定）",
+      "credentialMissing": "未設定，前往供應商設定",
+      "addModel": "新增圖片模型",
+      "providerDefaults": "預設參數",
+      "size": "尺寸",
+      "format": "格式",
+      "quality": "品質",
+      "watermark": "浮水印",
+      "aspectRatio": "長寬比",
+      "speechRecognition": "語音辨識",
+      "speechSynthesis": "語音合成",
+      "comingSoon": "即將推出",
+      "noProvider": "請選擇一個供應商查看詳情",
+      "models": "圖片模型",
+      "globalDefault": "全域預設",
+      "followGlobal": "跟隨全域預設",
+      "default": "預設"
+    },
     "oauth": {
       "title": "快速登入",
       "login": "登入",
@@ -1009,7 +1104,7 @@
       "searchProviderField": "搜尋引擎",
       "searchApiKey": "搜尋 API Key",
       "searchApiKeyHint": "啟用搜尋時請填寫所選 provider 的 API Key",
-      "searchApiKeysAutoHint": "Auto 會優先使用已設定的 Tavily、Brave、Serper，額度耗盡、報錯、空結果或相關性較弱時再回退到瀏覽器搜尋。",
+      "searchApiKeysAutoHint": "Auto 會優先使用已設定的 Tavily、Brave、Serper，然後使用 AnySearch 免費搜尋；額度耗盡、報錯、空結果或相關性較弱時再回退到瀏覽器搜尋。",
       "searchApiKeyNotRequired": "瀏覽器搜尋不需要 API Key，會在本機背景開啟搜尋頁並整理結果。",
       "favorites": "收藏",
       "searchModel": "搜尋模型...",
@@ -1143,7 +1238,7 @@
       "homeFolderBrowse": "選擇資料夾"
     },
     "toolCaps": {
-      "title": "技能安全設定"
+      "title": "技能安裝權限"
     },
     "skills": {
       "title": "技能管理",
@@ -1152,8 +1247,6 @@
       "agentConfigTitle": "Agent Skill 設定",
       "configureFor": "正在設定:",
       "userSkillsTitle": "助手技能配置",
-      "learnedSkillsTitle": "自學技能",
-      "learnedEmpty": "此助手還沒有自學過技能",
       "user": "使用者技能",
       "system": "系統技能",
       "add": "新增技能",
@@ -1164,8 +1257,6 @@
       "enabled": "已啟用",
       "disabled": "未啟用",
       "noSkills": "暫無可用技能",
-      "learned": "助手自學",
-      "noLearned": "助手尚未自學任何技能",
       "noUser": "暫無自訂技能",
       "copyToSkills": "複製到我的技能",
       "copied": "已複製 ✓",
@@ -1182,7 +1273,7 @@
       "compatAutoDiscovered": "自動發現",
       "compatNotInstalled": "未安裝",
       "learnCreate": "自行建立 / 安裝技能",
-      "learnCreateDesc": "允許 Agent 編寫新技能或透過工具呼叫安裝到自己的目錄",
+      "learnCreateDesc": "允許 Agent 編寫新技能或透過工具呼叫安裝到通用技能池，並預設只為目前 Agent 啟用",
       "fetchRemote": "從 GitHub / ClawHub 主動取得技能",
       "fetchRemoteDesc": "開啟後 Agent 會在執行專業任務時主動搜尋並安裝合適的技能，請謹慎",
       "safetyReview": "安裝前安全審查",
@@ -1353,6 +1444,20 @@
       "qqAppId": "App ID",
       "qqAppSecret": "App Secret",
       "qqHint": "從 QQ 機器人開放平台（q.qq.com/qqbot）取得",
+      "wechat": "微信",
+      "wechatHint": "透過微信 iLink 協議接入個人號",
+      "wechatExclusive": "一個微信號只能綁定一個 Agent，綁定新 Agent 後舊的會自動失效",
+      "wechatScan": "掃碼登入",
+      "wechatRescan": "重新登入",
+      "wechatLoggedIn": "已登入",
+      "wechatNeedScan": "請先掃碼登入",
+      "wechatScanning": "請用微信掃描 QR Code",
+      "wechatScanned": "已掃碼，請在手機上確認",
+      "wechatExpired": "QR Code 已過期",
+      "wechatLoginSuccess": "登入成功",
+      "wechatLoginFailed": "登入失敗",
+      "wechatUnbind": "解除綁定",
+      "wechatUnbound": "已解除微信綁定",
       "connected": "已連線",
       "disconnected": "未連線",
       "error": "連線失敗",
@@ -1413,9 +1518,14 @@
       "failed": "連線區域網路伺服器失敗"
     },
     "name": {
-      "title": "我該怎麼稱呼你？",
-      "subtitle": "這會讓我們的對話更自然",
-      "placeholder": "輸入你的名字",
+      "title": "名字與記憶",
+      "subtitle": "先讓我知道該怎麼稱呼你，也給這個 Agent 一個名字。",
+      "userLabel": "我該怎麼稱呼你？",
+      "placeholder": "你的名字",
+      "agentLabel": "這個 Agent 叫什麼？",
+      "agentPlaceholder": "小花",
+      "memoryTitle": "記憶系統",
+      "memoryHint": "開啟後，系統會在對話結束時整理聊天內容，形成記憶。因為記憶會經常更新，會導致模型快取命中率降低，關掉記憶時通常會更省錢。",
       "back": "上一步",
       "next": "下一步"
     },
@@ -1531,6 +1641,12 @@
     "title": "任務計畫",
     "empty": "暫無任務計畫\n助手會在需要時自動建立",
     "defaultModel": "預設模型",
+    "executor": {
+      "agentSession": "助手執行",
+      "notify": "通知",
+      "pluginAction": "外掛動作",
+      "directAction": "直接動作"
+    },
     "edit": "編輯",
     "delete": "刪除"
   },
@@ -1759,7 +1875,7 @@
     "skillMissingName": "SKILL.md 中缺少 name 欄位",
     "skillNameInvalid": "技能名稱無效（\"{name}\"）。僅允許字母、數字、底線和短橫線。",
     "skillPathMustBeAbsolute": "路徑必須是絕對路徑: {path}",
-    "skillCannotAddSelfDir": "不能新增 Hanako 自身的技能目錄",
+    "skillCannotAddSelfDir": "不能新增 HanaAgent 自身的技能目錄",
     "skillInvalidName": "無效的技能名稱",
     "skillExternalCannotDelete": "外部相容技能無法從此處刪除",
     "skillNotExists": "技能不存在",
@@ -1832,7 +1948,7 @@
     "subagentStopReason": "子 agent 未完整完成（stopReason: {reason}）。",
     "subagentToolFailed": "子 agent 工具執行失敗: {msg}",
     "subagentDispatched": "子任務已派出 (task-id: {taskId})。完成後結果會自動送達。",
-    "installSkillDisabled": "自學技能能力未啟用。請在設定中開啟「允許 Agent 自行建立/安裝技能」。",
+    "installSkillDisabled": "技能安裝能力未啟用。請在設定中開啟「允許 Agent 自行建立/安裝技能」。",
     "installSkillGithubDisabled": "GitHub 技能獲取未啟用。請在設定中開啟「允許從 GitHub 獲取技能」。",
     "installSkillInvalidGithubUrl": "無效的 GitHub URL：{url}",
     "installSkillGithubApiFailed": "無法取得倉庫資訊（HTTP {status}）。請檢查 URL 是否正確。",
@@ -1848,6 +1964,7 @@
     "installSkillSizeLimit": "技能內容超過大小上限（{size}KB > {max}KB）",
     "installSkillNoUtility": "安全審查不可用：未設定 utility 模型，請在設定中配置輔助模型",
     "installSkillUtilityIncomplete": "安全審查不可用：輔助模型設定不完整（缺少 API key 或 base URL），請在設定中補全",
+    "installSkillSafetyPassed": "✓ 安全審查已通過",
     "installSkillSafetyEmpty": "安全審查回傳空回應",
     "installSkillSafetyUnexpected": "安全審查回傳未預期的格式: {reply}",
     "installSkillSafetyTimeout": "安全審查逾時或網路錯誤",
@@ -1927,7 +2044,7 @@
   },
   "main": {
     "tray": {
-      "show": "顯示 Hanako",
+      "show": "顯示 HanaAgent",
       "settings": "設定",
       "quit": "結束"
     },
@@ -1935,15 +2052,17 @@
       "selectFolder": "選擇工作資料夾",
       "selectSkill": "選擇技能",
       "selectPlugin": "選擇插件",
-      "launchFailedTitle": "Hanako 啟動失敗",
-      "launchFailedBody": "Hanako v{version}\n\n{detail}\n\n詳細日誌已儲存至：\n{logPath}\n\n請將此截圖或日誌檔案傳送給開發者。",
-      "serverRestartFailed": "Hanako v{version}\n\nServer 崩潰後重新啟動失敗。\n{error}\n\n請重新啟動應用程式。",
-      "serverMultipleCrash": "Hanako v{version}\n\nServer 多次崩潰 ({reason})。\n\n請重新啟動應用程式。",
+      "launchFailedTitle": "HanaAgent 啟動失敗",
+      "launchFailedBody": "HanaAgent v{version}\n\n{detail}\n\n詳細日誌已儲存至：\n{logPath}\n\n請將此截圖或日誌檔案傳送給開發者。",
+      "serverRestartFailed": "HanaAgent v{version}\n\nServer 崩潰後重新啟動失敗。\n{error}\n\n請重新啟動應用程式。",
+      "serverMultipleCrash": "HanaAgent v{version}\n\nServer 多次崩潰 ({reason})。\n\n請重新啟動應用程式。",
       "serverStartTimeout": "Server 啟動逾時",
       "serverKilledBySignal": "Server 被訊號終止 ({signal})",
       "serverExitedWithCode": "Server 已結束，code: {code}",
-      "serverFilesNotReady": "自動更新剛完成，新版本檔案仍在寫入磁碟（缺少 {missing}），已等待 {waited} 秒仍未就緒。請稍後重新啟動 Hanako。",
-      "serverModuleMissing": "Server 啟動失敗：找不到模組 {module}。\n通常是自動更新剛完成、新版本檔案仍在寫入磁碟所致。\n建議：等待 1-2 分鐘後重新啟動 Hanako；若反覆出現，請至 GitHub 回報。"
+      "serverFilesNotReady": "自動更新剛完成，新版本檔案仍在寫入磁碟（缺少 {missing}），已等待 {waited} 秒仍未就緒。請稍後重新啟動 HanaAgent。",
+      "serverModuleMissing": "Server 啟動失敗：找不到模組 {module}。\n通常是自動更新剛完成、新版本檔案仍在寫入磁碟所致。\n建議：等待 1-2 分鐘後重新啟動 HanaAgent；若反覆出現，請至 GitHub 回報。",
+      "installFailedTitle": "HanaAgent 更新",
+      "installFailedBody": "更新安裝失敗：\n{error}\n\n請重新啟動 HanaAgent 後重試，或前往設定頁面手動檢查更新。"
     },
     "notification": {
       "ready": "通知已就緒"
@@ -2097,6 +2216,11 @@
       "filePathDesc": "（相容）單一個本機檔案的絕對路徑；新呼叫優先使用 filepaths。",
       "labelDesc": "（相容）顯示給使用者的檔案名稱，通常可以省略，預設使用檔名。"
     },
+    "wait": {
+      "label": "等待",
+      "description": "等待指定秒數。用於等待後台任務完成時保持 turn 活躍。",
+      "secondsDesc": "等待秒數（1-300）"
+    },
     "subagent": {
       "label": "啟動子 Agent",
       "description": "將任務派給子 agent 執行。可指定其他 agent（傳 agent 參數），不指定則自己分身執行。傳 agent=\"?\" 查看可用 agent 列表。\n\n你的判斷：\n- 如果目前還有可以並行推進的工作，繼續做\n- 如果必須拿到結果才能進行下一步，告訴使用者你已經派出去了、在等回覆，然後正常等待即可\n\n適用場景：\n- 需要大量搜尋、閱讀後總結為簡短結論的調研任務\n- 可以和目前思路並行的獨立子問題\n- 需要在多個方向同時探索的任務（可同時發起多個 subagent 呼叫）\n- 讓另一個 agent 從其專業視角處理任務\n不適用：需要修改檔案、執行命令等有副作用的操作\n\n重要：task 參數要寫清楚完整的指令和必要背景，子 agent 看不到目前的對話歷史。",
@@ -2106,16 +2230,15 @@
     },
     "installSkill": {
       "label": "安裝技能",
-      "description": "為自己安裝新技能（skill）。模式 A：提供 GitHub 儲存庫 URL（含 SKILL.md），自動擷取並安裝。模式 B：直接提供 skill_content + skill_name，適合自行撰寫。安裝後技能立即生效。",
+      "description": "安裝新技能（skill）到通用技能池，並預設只為目前 Agent 啟用。模式 A：提供 GitHub 儲存庫 URL（含 SKILL.md），自動擷取並安裝。模式 B：直接提供 skill_content + skill_name，適合自行撰寫。",
       "githubUrlDesc": "GitHub 儲存庫 URL（模式 A）",
       "skillContentDesc": "SKILL.md 的完整內容（模式 B）",
       "skillNameDesc": "技能名稱（模式 B 必填）",
-      "reasonDesc": "說明為什麼需要這個技能（稽核用，必填）",
-      "userRequestedDesc": "是否由使用者主動要求安裝（true 時安裝為使用者技能，否則為自學技能）"
+      "reasonDesc": "說明為什麼需要這個技能（稽核用，必填）"
     },
     "updateSettings": {
       "label": "設定",
-      "description": "修改 Hanako 的設定。支援兩種操作：\n- search + query：用關鍵字搜尋設定項，查看當前值和可選項\n- apply + key + value：修改指定設定項，需使用者確認\n\n如果已知確切 key，可以直接 apply 跳過搜尋。",
+      "description": "修改 HanaAgent 的設定。支援兩種操作：\n- search + query：用關鍵字搜尋設定項，查看當前值和可選項\n- apply + key + value：修改指定設定項，需使用者確認\n\n如果已知確切 key，可以直接 apply 跳過搜尋。",
       "actionDesc": "操作類型：search 搜尋設定項 / apply 修改設定",
       "queryDesc": "搜尋關鍵字（search 時必填）",
       "keyDesc": "設定項 key（透過 search 取得）",
@@ -2128,7 +2251,7 @@
       "sandbox": "沙盒安全",
       "sandboxDesc": "限制檔案系統寫入範圍",
       "sandboxNetwork": "沙盒聯網",
-      "sandboxNetworkDesc": "允許沙盒內命令存取公網；關閉沙盒時命令本身已不受 Hana 網路限制",
+      "sandboxNetworkDesc": "允許沙盒內命令存取公網；Windows 命令沙盒暫不支援網路隔離，會始終按目前使用者網路權限執行",
       "locale": "語言",
       "timezone": "時區",
       "timezoneDesc": "IANA 時區（如 Asia/Shanghai）",
@@ -2204,7 +2327,7 @@
     "inputHelp": "輸入 /help 查看命令列表"
   },
   "sandbox": {
-    "blocked": "[安全策略] {reason}\n\n此操作被 Hanako 的沙盒安全策略阻止，表示命令越過了路徑或權限邊界。先檢查目前工作台、具體路徑寫法，以及目標檔案是否本來就應該放在允許的工作台或 session 路徑內。請向使用者說明被攔截的路徑和原因；只有使用者明確決定時，再討論是否修改沙盒設定。",
+    "blocked": "[安全策略] {reason}\n\n此操作被 HanaAgent 的沙盒安全策略阻止，表示命令越過了路徑或權限邊界。先檢查目前工作台、具體路徑寫法，以及目標檔案是否本來就應該放在允許的工作台或 session 路徑內。請向使用者說明被攔截的路徑和原因；只有使用者明確決定時，再討論是否修改沙盒設定。",
     "noSudo": "禁止使用 sudo",
     "noSu": "禁止使用 su 切換使用者",
     "noChmod": "禁止修改檔案權限",
@@ -2259,7 +2382,6 @@
   "preview.toggle": "預覽面板",
   "preview.markdownPreview": "預覽",
   "preview.exitMarkdownPreview": "回到編輯",
-  "preview.openInNewWindow": "在新視窗查看",
-  "preview.openInNewWindowUnsupported": "此類型不支援新視窗查看",
-  "preview.markdownEditorStatus": "選中 {selected} 字 · 共 {total} 字"
+  "preview.markdownEditorStatus": "選中 {selected} 字 · 共 {total} 字",
+  "preview.markdownAttachmentInsertFailed": "插入附件失敗"
 }

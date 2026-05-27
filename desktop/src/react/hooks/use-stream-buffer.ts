@@ -356,8 +356,6 @@ class StreamBufferManager {
         break;
 
       case 'content_block': {
-        this.ensureMessage(buf);
-        this.flush(buf);
         let block = msg.block;
         // Apply cached patches (block_update 可能先于 content_block 到达)
         if (block.taskId) {
@@ -368,9 +366,22 @@ class StreamBufferManager {
             delete pending[block.taskId];
           }
         }
+
+        const taskId = replacementTaskId(block);
+        if (taskId) {
+          if (this.hasTurnState(buf)) this.flush(buf);
+          const consumed = useStore.getState().resolveBlockByTaskId(buf.sessionPath, taskId, block);
+          if (consumed) {
+            bumpMessageLiveVersion(buf.sessionPath);
+            break;
+          }
+        }
+
+        this.ensureMessage(buf);
+        this.flush(buf);
         this.updateTargetMessage(buf, (m) => ({
           ...m,
-          blocks: [...(m.blocks || []), block],
+          blocks: mergeContentBlock([...(m.blocks || [])], block),
         }));
         break;
       }
@@ -441,6 +452,36 @@ class StreamBufferManager {
 
 /** 全局 singleton */
 export const streamBufferManager = new StreamBufferManager();
+
+function mergeContentBlock(blocks: ContentBlock[], block: ContentBlock): ContentBlock[] {
+  if (block.type === 'media_generation' && block.status === 'pending') {
+    const resolved = blocks.some((existing) => isResolvedTaskBlock(existing, block.taskId));
+    if (resolved) return blocks;
+  }
+  const taskId = replacementTaskId(block);
+  if (!taskId) return [...blocks, block];
+  const idx = blocks.findIndex((existing) => (
+    existing.type === 'media_generation' &&
+    existing.taskId === taskId
+  ));
+  if (idx < 0) return [...blocks, block];
+  const next = [...blocks];
+  next[idx] = block;
+  return next;
+}
+
+function replacementTaskId(block: ContentBlock): string | null {
+  if (block.type === 'file') return block.replacesTaskId || null;
+  if (block.type === 'media_generation' && block.status !== 'pending') return block.taskId;
+  return null;
+}
+
+function isResolvedTaskBlock(block: ContentBlock, taskId: string): boolean {
+  if (block.type === 'file') return block.replacesTaskId === taskId;
+  return block.type === 'media_generation' &&
+    block.taskId === taskId &&
+    block.status !== 'pending';
+}
 
 // 让 chat-slice / session-actions 通过桥接模块触达 manager，打破循环依赖。
 registerStreamBufferInvalidator((sessionPath) => {

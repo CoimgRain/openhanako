@@ -1,9 +1,9 @@
 /**
- * Hanako Desktop — Electron 主进程
+ * HanaAgent Desktop — Electron 主进程
  *
  * 职责：
  * 1. 创建启动窗口（splash）
- * 2. spawn() 启动 Hanako Server
+ * 2. spawn() 启动 HanaAgent Server
  * 3. 等待 server 就绪 + 主窗口初始化完成
  * 4. 关闭 splash，显示主窗口
  * 5. 优雅关闭
@@ -26,6 +26,10 @@ const { readTextFileSnapshot, writeTextFileIfUnchanged } = require("./file-text-
 const chokidar = require("chokidar");
 const { wrapIpcHandler, wrapIpcBestEffortHandler, wrapIpcOn } = require('./ipc-wrapper.cjs');
 const themeRegistry = require('./src/shared/theme-registry.cjs');
+const {
+  completeOnboardingAndOpenMain,
+  submitOnboardingCompleteIntent,
+} = require("./src/shared/onboarding-completion.cjs");
 const { resolveTrashItemPath } = require("./src/shared/trash-item-path.cjs");
 const { redactLogText } = require("../shared/log-redactor.cjs");
 const {
@@ -51,6 +55,9 @@ const {
   withForcedLocalProxyBypass,
 } = require("../shared/network-proxy.cjs");
 const {
+  resolveWorkspaceOutputDir,
+} = require("../shared/workspace-output.cjs");
+const {
   applyGpuStartupPolicy,
   buildGpuStartupDiagnostics,
   markGpuStartupFailed,
@@ -61,6 +68,18 @@ const {
   recordGpuInfoUpdate,
   resolveGpuStartupPolicy,
 } = require("./src/shared/gpu-startup-policy.cjs");
+const {
+  buildWin32ServerEnv,
+} = require("./src/shared/server-process-env.cjs");
+const {
+  sanitizeWindowState,
+} = require("./src/shared/window-state.cjs");
+const {
+  decorateScreenshotMarkdownIt,
+  escapeAttr,
+  renderScreenshotMarkdownArticle,
+  renderScreenshotCodeArticle,
+} = require("./src/shared/screenshot-markdown.cjs");
 
 const APP_USER_MODEL_ID = "com.hanako.app"; // Keep in sync with package.json build.appId.
 
@@ -70,7 +89,7 @@ const APP_USER_MODEL_ID = "com.hanako.app"; // Keep in sync with package.json bu
   const preloadPath = path.join(__dirname, "preload.bundle.cjs");
   if (!fs.existsSync(preloadPath)) {
     const msg = `Missing preload bundle:\n${preloadPath}\n\nBuild is incomplete. Run 'npm run build:preload' or rebuild the installer.`;
-    try { dialog.showErrorBox("Hanako failed to start", msg); } catch {}
+    try { dialog.showErrorBox("HanaAgent failed to start", msg); } catch {}
     console.error("[desktop] " + redactLogText(msg));
     process.exit(1);
   }
@@ -195,7 +214,7 @@ async function serverEnvironmentForNetworkProxy(baseEnv) {
 }
 
 // 按 HANA_HOME 隔离 Electron userData（localStorage / cache / session）
-// 生产: ~/Library/Application Support/Hanako
+// 生产: ~/Library/Application Support/Hanako（历史目录，随 HanaAgent 显示名保留）
 // 开发: ~/Library/Application Support/Hanako-dev
 const defaultHome = path.join(os.homedir(), ".hanako");
 configureClientSingleInstance(app, {
@@ -225,6 +244,7 @@ if (process.platform === "win32") {
     platform: process.platform,
     phase: "electron-starting",
     startupId: desktopStartupId,
+    policy: gpuStartupPolicy,
   });
 }
 
@@ -233,6 +253,7 @@ app.on("child-process-gone", (_event, details) => {
   if (!recordGpuChildProcessGone({
     hanakoHome,
     platform: process.platform,
+    policy: gpuStartupPolicy,
     details,
   })) {
     return;
@@ -308,7 +329,8 @@ let serverPort = null;
 let serverToken = null;
 let isQuitting = false;  // 区分关窗口（hide）和真正退出（quit）
 let tray = null;
-let reusedServerPid = null; // 复用已有 server 时记录其 PID，退出时发 SIGTERM
+let reusedServerPid = null; // 复用已有 server 时记录其 PID，用 owner 字段决定是否关闭
+let reusedServerOwned = false; // 仅 desktop-owned 的复用 server 才由 desktop 退出时关闭
 let isExitingServer = false; // 只有托盘"退出"时才 kill server，其余路径仅关前端
 let _isUpdating = false;  // auto-updater 正在执行 quitAndInstall，before-quit 跳过 server 清理
 let _autoUpdaterInitialized = false;
@@ -502,35 +524,26 @@ function hasExistingConfig() {
   return false;
 }
 
-/**
- * 一次性迁移：为 onboarding 功能上线前的老用户补写 setupComplete 标记。
- * 判断依据：agents/ 下存在至少一个含 config.yaml 的目录 → 用户配置过 agent → 老用户。
- * 补写后后续启动直接走 isSetupComplete() 快速路径，不再弹任何 onboarding 窗口。
- */
-function migrateSetupComplete() {
-  if (isSetupComplete()) return;
+function hasLegacyProviderConfig() {
   // 判断依据：added-models.yaml 存在且含有真实 api_key → 老用户配置过 provider。
   // 不能只看 agents/*/config.yaml 是否存在，因为 ensureFirstRun 会为全新用户
   // 播种默认 agent（含 config.yaml），导致新用户被误判为老用户而跳过 onboarding。
   try {
     const modelsPath = path.join(hanakoHome, "added-models.yaml");
-    if (!fs.existsSync(modelsPath)) return;
+    if (!fs.existsSync(modelsPath)) return false;
     const content = fs.readFileSync(modelsPath, "utf-8");
-    if (!/api_key:\s*["']?[^"'\s]+/.test(content)) return;
+    return /api_key:\s*["']?[^"'\s]+/.test(content);
   } catch {
-    return;
+    return false;
   }
-  const prefsPath = path.join(hanakoHome, "user", "preferences.json");
-  try {
-    let prefs = {};
-    try { prefs = JSON.parse(fs.readFileSync(prefsPath, "utf-8")); } catch {}
-    prefs.setupComplete = true;
-    fs.mkdirSync(path.dirname(prefsPath), { recursive: true });
-    fs.writeFileSync(prefsPath, JSON.stringify(prefs, null, 2) + "\n", "utf-8");
-    console.log("[desktop] 检测到老用户（已有 agent 配置），自动补写 setupComplete");
-  } catch (err) {
-    console.error("[desktop] migrateSetupComplete failed:", err);
-  }
+}
+
+async function migrateSetupCompleteViaServerIfNeeded() {
+  if (isSetupComplete()) return false;
+  if (!hasLegacyProviderConfig()) return false;
+  await submitOnboardingCompleteIntent({ serverPort, serverToken });
+  console.log("[desktop] 检测到老用户（已有 agent 配置），已通过 server 标记 setupComplete");
+  return true;
 }
 
 // ── 启动 Server ──
@@ -582,6 +595,8 @@ async function waitForProcessExit(proc, pid, timeoutMs) {
 const {
   ensureServerFilesReady,
   isModuleResolutionError,
+  parsePortInUseStartupError,
+  extractRootServerStartupError,
   SERVER_INFO_FIRST_WAIT_MS,
   shouldKeepWaitingForServerInfo,
 } = require("./src/shared/server-readiness.cjs");
@@ -645,6 +660,69 @@ function pollServerInfo(infoPath, {
   });
 }
 
+async function verifyReusableServerInfo(existingInfo) {
+  const port = Number(existingInfo?.port);
+  const token = typeof existingInfo?.token === "string" ? existingInfo.token : "";
+  const pid = Number(existingInfo?.pid);
+  if (!Number.isInteger(port) || port <= 0 || !token || !Number.isInteger(pid)) {
+    return { reusable: false, trusted: false, terminate: false, reason: "invalid server-info shape" };
+  }
+
+  const currentVersion = app.getVersion();
+  const headers = { Authorization: `Bearer ${existingInfo.token}` };
+  let health = null;
+  let identity = null;
+  try {
+    const healthRes = await fetch(`http://127.0.0.1:${port}/api/health`, {
+      headers,
+      signal: AbortSignal.timeout(2000),
+    });
+    if (!healthRes.ok) {
+      return { reusable: false, trusted: false, terminate: false, reason: `health returned ${healthRes.status}` };
+    }
+    health = await healthRes.json().catch(() => null);
+  } catch (err) {
+    return { reusable: false, trusted: false, terminate: false, reason: `health failed: ${err.message}` };
+  }
+
+  try {
+    const identityRes = await fetch(`http://127.0.0.1:${port}/api/server/identity`, {
+      headers,
+      signal: AbortSignal.timeout(2000),
+    });
+    if (!identityRes.ok) {
+      return { reusable: false, trusted: false, terminate: false, reason: `identity returned ${identityRes.status}` };
+    }
+    identity = await identityRes.json().catch(() => null);
+  } catch (err) {
+    return { reusable: false, trusted: false, terminate: false, reason: `identity failed: ${err.message}` };
+  }
+
+  if (!identity || !identity.studioId) {
+    return { reusable: false, trusted: false, terminate: false, reason: "identity missing studioId" };
+  }
+
+  const healthVersion = health?.version;
+  const identityVersion = identity?.version;
+  const serverInfoVersion = existingInfo.version;
+  const versionMatches = (!serverInfoVersion || serverInfoVersion === currentVersion)
+    && (!healthVersion || healthVersion === currentVersion)
+    && (!identityVersion || identityVersion === currentVersion);
+  if (!versionMatches) {
+    return { reusable: false, trusted: true, terminate: true, reason: "version mismatch", health, identity };
+  }
+
+  if (existingInfo.studioId && existingInfo.studioId !== identity.studioId) {
+    return { reusable: false, trusted: true, terminate: false, reason: "studio identity mismatch", health, identity };
+  }
+
+  return { reusable: true, trusted: true, terminate: false, reason: "ok", health, identity };
+}
+
+function isDesktopOwnedServerInfo(info) {
+  return info?.ownerKind === "desktop";
+}
+
 async function startServer() {
   const serverInfoPath = path.join(hanakoHome, "server-info.json");
 
@@ -660,41 +738,28 @@ async function startServer() {
     })();
 
     if (pidAlive) {
-      // 版本校验：server-info 中的 version 必须与当前 app 版本一致，
-      // 否则是更新后残存的旧 server，必须杀掉重启
-      const currentVersion = app.getVersion();
-      const serverVersion = existingInfo.version;
-      if (serverVersion && serverVersion !== currentVersion) {
-        console.log(`[desktop] 旧 server 版本不匹配（server: ${serverVersion}, app: ${currentVersion}），终止旧 server`);
+      const verification = await verifyReusableServerInfo(existingInfo);
+      if (verification.reusable) {
+        console.log(`[desktop] 复用已运行的 server，端口: ${existingInfo.port}, 版本: ${existingInfo.version || "unknown"}, studio: ${verification.identity.studioId}`);
+        serverPort = existingInfo.port;
+        serverToken = existingInfo.token;
+        reusedServerPid = existingInfo.pid;
+        reusedServerOwned = isDesktopOwnedServerInfo(existingInfo);
+        return; // 跳过启动
+      }
+
+      if (verification.terminate) {
+        console.log(`[desktop] 可信旧 server 不可复用（${verification.reason}），正在终止 PID ${existingInfo.pid}`);
+        killPid(existingInfo.pid);
+        const deadline = Date.now() + 2000;
+        while (Date.now() < deadline) {
+          try { process.kill(existingInfo.pid, 0); } catch { break; }
+          await new Promise(r => setTimeout(r, 100));
+        }
+        killPid(existingInfo.pid, true);
       } else {
-        // PID 存活且版本匹配（或无版本字段的老 server），尝试 health check
-        let reused = false;
-        try {
-          const res = await fetch(`http://127.0.0.1:${existingInfo.port}/api/health`, {
-            headers: { Authorization: `Bearer ${existingInfo.token}` },
-            signal: AbortSignal.timeout(2000),
-          });
-          if (res.ok) {
-            console.log(`[desktop] 复用已运行的 server，端口: ${existingInfo.port}, 版本: ${serverVersion || "unknown"}`);
-            serverPort = existingInfo.port;
-            serverToken = existingInfo.token;
-            reusedServerPid = existingInfo.pid;
-            reused = true;
-          }
-        } catch { /* health check 网络抖动，继续 kill 旧 server */ }
-
-        if (reused) return; // 跳过启动
+        console.warn(`[desktop] server-info 不可信，拒绝复用且不自动终止 PID ${existingInfo.pid}: ${verification.reason}`);
       }
-
-      // PID 存活但 health 失败（无响应或异常）：主动 kill，避免双 server 并存
-      console.log(`[desktop] 旧 server (PID ${existingInfo.pid}) 无响应，正在终止...`);
-      killPid(existingInfo.pid);
-      const deadline = Date.now() + 2000;
-      while (Date.now() < deadline) {
-        try { process.kill(existingInfo.pid, 0); } catch { break; }
-        await new Promise(r => setTimeout(r, 100));
-      }
-      killPid(existingInfo.pid, true);
     }
 
     // PID 已死或已 kill，删除脏文件
@@ -729,6 +794,14 @@ async function startServer() {
       return;
     } catch (err) {
       lastErr = err;
+      const portConflict = parsePortInUseStartupError(_serverLogs);
+      if (portConflict) {
+        const friendly = new Error(formatPortInUseStartupError(portConflict));
+        friendly.code = "PORT_IN_USE";
+        friendly.startupError = portConflict;
+        friendly.cause = err;
+        throw friendly;
+      }
       const missingModule = isModuleResolutionError(_serverLogs);
       const canRetry = missingModule && attempt === 0;
       if (!canRetry) {
@@ -759,11 +832,18 @@ async function startServer() {
 async function _spawnServerOnce(serverInfoPath) {
   _serverLogs = [];
   _lastServerProgressAtMs = null;
+  reusedServerPid = null;
+  reusedServerOwned = false;
 
-  let serverEnv = { ...withHanaPiSdkEnv(process.env, hanakoHome), HANA_HOME: hanakoHome };
+  let serverEnv = {
+    ...withHanaPiSdkEnv(process.env, hanakoHome),
+    HANA_HOME: hanakoHome,
+    HANA_SERVER_OWNER: "desktop",
+    HANA_SERVER_OWNER_PID: String(process.pid),
+  };
   serverEnv = await serverEnvironmentForNetworkProxy(serverEnv);
 
-  // Windows: 注入 PortableGit 路径
+  // Windows: 注入 PortableGit 路径，并从注册表补齐当前系统 / 用户 PATH。
   if (process.platform === "win32") {
     // PortableGit 结构：cmd/git.exe, bin/bash.exe, usr/bin/*, mingw64/bin/*
     const gitRoot = path.join(process.resourcesPath || "", "git");
@@ -773,16 +853,9 @@ async function _spawnServerOnce(serverInfoPath) {
       path.join(gitRoot, "mingw64", "bin"),
       path.join(gitRoot, "cmd"),
     ].filter(p => fs.existsSync(p));
-    if (gitPaths.length) {
-      // Windows 的 PATH 环境变量 key 可能是 "Path"（title case）或 "PATH"，
-      // { ...process.env } 展开后变成普通对象（区分大小写）。
-      // 必须找到原始 key 并删除，否则会同时存在 Path 和 PATH 两个 key，
-      // 导致 spawn 子进程的 PATH 不可预测。
-      const pathKey = Object.keys(serverEnv).find(k => k.toLowerCase() === "path") || "PATH";
-      const existingPath = serverEnv[pathKey] || "";
-      if (pathKey !== "PATH") delete serverEnv[pathKey];
-      serverEnv.PATH = gitPaths.join(";") + ";" + existingPath;
-    }
+    serverEnv = await buildWin32ServerEnv(serverEnv, {
+      prependPathEntries: gitPaths,
+    });
   }
 
   // 选择 server 启动方式
@@ -908,14 +981,14 @@ function monitorServer() {
       } catch (err) {
         console.error("[desktop] Server 重启失败:", err.message);
         writeCrashLog(`Server 重启失败: ${err.message}`);
-        dialog.showErrorBox("Hanako Server", mt("dialog.serverRestartFailed", {
+        dialog.showErrorBox("HanaAgent Server", mt("dialog.serverRestartFailed", {
           version: app?.getVersion?.() || "unknown",
           error: err.message,
         }));
       }
     } else {
       writeCrashLog(`Server 多次崩溃 (${reason})，放弃重启`);
-      dialog.showErrorBox("Hanako Server", mt("dialog.serverMultipleCrash", {
+      dialog.showErrorBox("HanaAgent Server", mt("dialog.serverMultipleCrash", {
         version: app?.getVersion?.() || "unknown",
         reason,
       }));
@@ -941,7 +1014,7 @@ function showPrimaryWindow() {
 /**
  * 创建系统托盘图标
  * - 双击：显示主窗口
- * - 右键菜单：显示 Hanako / 设置 / 退出
+ * - 右键菜单：显示 HanaAgent / 设置 / 退出
  */
 function createTray() {
   const isDev = !app.isPackaged;
@@ -963,10 +1036,10 @@ function createTray() {
     if (process.platform === "darwin") icon.setTemplateImage(true);
   }
   tray = new Tray(icon);
-  tray.setToolTip(isDev ? "Hanako (dev)" : "Hanako");
+  tray.setToolTip(isDev ? "HanaAgent (dev)" : "HanaAgent");
 
   const buildMenu = () => Menu.buildFromTemplate([
-    { label: mt("tray.show", null, "Show Hanako"), click: () => showPrimaryWindow() },
+    { label: mt("tray.show", null, "Show HanaAgent"), click: () => showPrimaryWindow() },
     { label: mt("tray.settings", null, "Settings"), click: () => createSettingsWindow() },
     { type: "separator" },
     { label: mt("tray.quit", null, "Quit"), click: () => { isExitingServer = true; isQuitting = true; app.quit(); } },
@@ -1032,14 +1105,35 @@ function buildServerCrashDiagnostics() {
   return items.join("\n");
 }
 
+function formatPortInUseStartupError(conflict) {
+  const host = conflict?.host || "unknown";
+  const port = conflict?.port ?? "unknown";
+  const networkMode = conflict?.networkMode || "unknown";
+  const suggestions = Array.isArray(conflict?.suggestions) && conflict.suggestions.length
+    ? `\n\n${conflict.suggestions.map(item => `- ${item}`).join("\n")}`
+    : "";
+  return `PORT_IN_USE: ${host}:${port} is already in use (network mode: ${networkMode}).${suggestions}`;
+}
+
+function buildLaunchFailureDialogDetail(err, crashInfo) {
+  const structuredPortConflict = err?.startupError?.code === "PORT_IN_USE"
+    ? formatPortInUseStartupError(err.startupError)
+    : null;
+  const rootServerError = structuredPortConflict || extractRootServerStartupError(_serverLogs);
+  const tail = crashInfo.length > 800 ? "...\n" + crashInfo.slice(-800) : crashInfo;
+  if (!rootServerError) return tail;
+  if (tail.includes(rootServerError)) return tail;
+  return `${rootServerError}\n\n${tail}`;
+}
+
 function writeCrashLog(errorMessage) {
   const logs = _serverLogs.join("");
   const timestamp = new Date().toISOString();
   const diagnostics = buildServerCrashDiagnostics();
 
   const content = redactMainLogText([
-    `=== Hanako Crash Log ===`,
-    `Hanako: v${app?.getVersion?.() || "unknown"}`,
+    `=== HanaAgent Crash Log ===`,
+    `HanaAgent: v${app?.getVersion?.() || "unknown"}`,
     `Time: ${timestamp}`,
     `Error: ${errorMessage}`,
     `Platform: ${process.platform} ${process.arch}`,
@@ -1079,7 +1173,7 @@ function createSplashWindow() {
     height: 280,
     resizable: false,
     frame: false,
-    title: "Hanako",
+    title: "HanaAgent",
     ...titleBarOpts({ x: 12, y: 12 }),
     transparent: true,
     show: false,
@@ -1141,7 +1235,12 @@ function saveWindowState() {
 
 // ── 创建主窗口 ──
 function createMainWindow() {
-  const saved = loadWindowState();
+  const saved = sanitizeWindowState(loadWindowState(), screen.getAllDisplays(), {
+    defaultWidth: 960,
+    defaultHeight: 820,
+    minWidth: 420,
+    minHeight: 500,
+  });
   const initialTheme = themeRegistry.DEFAULT_THEME;
 
   const opts = {
@@ -1149,7 +1248,7 @@ function createMainWindow() {
     height: saved?.height || 820,
     minWidth: 420,
     minHeight: 500,
-    title: "Hanako",
+    title: "HanaAgent",
     ...titleBarOpts({ x: 16, y: 16 }),
     backgroundColor: getThemeBackgroundColor(initialTheme),
     show: false,
@@ -2323,7 +2422,7 @@ function createOnboardingWindow(query = {}) {
     height: 780,
     resizable: false,
     frame: false,
-    title: "Hanako",
+    title: "HanaAgent",
     ...titleBarOpts({ x: 16, y: 16 }),
     backgroundColor: getThemeBackgroundColor(initialTheme),
     show: false,
@@ -2456,6 +2555,7 @@ function _getScreenshotMd() {
     const taskLists = require("markdown-it-task-lists");
     _screenshotMd.use(taskLists, { enabled: false, label: true });
   } catch { /* task-lists not available */ }
+  decorateScreenshotMarkdownIt(_screenshotMd);
   return _screenshotMd;
 }
 
@@ -2495,6 +2595,14 @@ function buildScreenshotHTML(payload) {
     const flowerUrl = pathToFileURL(getScreenshotResourcePath("sakura", flowerFile)).href;
     extraCSS += `\n:root { --sakura-branch-url: url('${branchUrl}'); --sakura-flower-url: url('${flowerUrl}'); }`;
   }
+  const isDesktopScreenshotTheme = themeName.endsWith("-desktop");
+  const coverBleedX = themeName.startsWith("sakura-")
+    ? (isDesktopScreenshotTheme ? "2.5rem" : "0.85rem")
+    : (isDesktopScreenshotTheme ? "3rem" : "0.85rem");
+  const coverBleedTop = themeName.startsWith("sakura-")
+    ? "5rem"
+    : (isDesktopScreenshotTheme ? "2rem" : "5rem");
+  extraCSS += `\n:root { --screenshot-cover-bleed-x: ${coverBleedX}; --screenshot-cover-bleed-top: ${coverBleedTop}; }`;
 
   // Logo 内联为 base64 data URL（asar 内文件无法被离屏窗口的 file:// 加载）
   let logoUrl = "";
@@ -2508,14 +2616,17 @@ function buildScreenshotHTML(payload) {
 
   function renderBlock(b) {
     if (b.type === "html") return b.content;
-    if (b.type === "markdown") return md.render(b.content);
-    if (b.type === "image") return `<img src="${b.content}" class="chat-image" />`;
+    if (b.type === "markdown") return md.render(b.content, { sourceFilePath: payload.filePath || null });
+    if (b.type === "image") return `<img src="${escapeAttr(b.content)}" class="chat-image" />`;
     return "";
   }
 
   let bodyHTML = "";
   if (payload.mode === "article" && payload.markdown) {
-    bodyHTML = `<article>${md.render(payload.markdown)}</article>`;
+    const articleHTML = payload.articleType === "code"
+      ? renderScreenshotCodeArticle(payload.markdown, payload.language)
+      : renderScreenshotMarkdownArticle(md, payload.markdown, { sourceFilePath: payload.filePath || null });
+    bodyHTML = `<article>${articleHTML}</article>`;
   } else if (payload.messages) {
     const parts = [];
     for (const msg of payload.messages) {
@@ -2550,6 +2661,29 @@ function buildScreenshotHTML(payload) {
     .chat-body { padding-left: 0; }
     .chat-body p:last-child { margin-bottom: 0; }
     .chat-image { width: ${themeName.endsWith("-desktop") ? "66.666%" : "100%"}; max-width: 100%; height: auto; border-radius: 6px; margin: 0.8em 0; display: block; }
+    .screenshot-cover {
+      width: calc(100% + var(--screenshot-cover-bleed-x) + var(--screenshot-cover-bleed-x));
+      overflow: visible;
+      margin: calc(0px - var(--screenshot-cover-bleed-top)) calc(0px - var(--screenshot-cover-bleed-x)) 1.35em;
+      border-radius: 0;
+      background: transparent;
+    }
+    .screenshot-cover-frame {
+      width: var(--screenshot-cover-display-width, 100%);
+      height: var(--screenshot-cover-height, 320px);
+      overflow: hidden;
+      margin: 0 auto;
+      background: transparent;
+    }
+    .screenshot-cover-frame img {
+      width: 100%;
+      max-width: none;
+      height: 100%;
+      object-fit: cover;
+      display: block;
+      margin: 0;
+      border-radius: 0;
+    }
     .watermark {
       display: flex; align-items: center; justify-content: center;
       gap: 0.5em; padding: 1.5em 0 1em; opacity: 0.5;
@@ -2573,7 +2707,7 @@ function buildScreenshotHTML(payload) {
   ${bodyHTML}
   <footer class="watermark">
     <img class="watermark-logo" src="${logoUrl}" />
-    <span class="watermark-text">OpenHanako</span>
+    <span class="watermark-text">HanaAgent</span>
   </footer>
 </body>
 </html>`;
@@ -2595,6 +2729,15 @@ async function screenshotCapture(htmlContent, width) {
     await offscreen.webContents.executeJavaScript(
       `document.fonts.ready.then(() => true)`
     );
+    await offscreen.webContents.executeJavaScript(`
+      Promise.all(Array.from(document.images).map((img) => {
+        if (img.complete) return true;
+        return new Promise((resolve) => {
+          img.addEventListener('load', resolve, { once: true });
+          img.addEventListener('error', resolve, { once: true });
+        });
+      })).then(() => true)
+    `);
     await new Promise(r => setTimeout(r, 300));
 
     const totalHeight = await offscreen.webContents.executeJavaScript(`
@@ -2756,10 +2899,14 @@ wrapIpcOn("window-theme-changed", (event, theme) => {
   applyWindowThemeColors(win, theme);
 });
 
-// 设置窗口 → 主窗口的消息转发
+// 设置窗口 / 主窗口之间的设置事件转发
 wrapIpcOn("settings-changed", (_event, type, data) => {
-  if (mainWindow && !mainWindow.isDestroyed()) {
+  const sender = _event?.sender || null;
+  if (mainWindow && !mainWindow.isDestroyed() && mainWindow.webContents !== sender) {
     mainWindow.webContents.send("settings-changed", type, data);
+  }
+  if (settingsWindow && !settingsWindow.isDestroyed() && settingsWindow.webContents !== sender) {
+    settingsWindow.webContents.send("settings-changed", type, data);
   }
   if (type === "theme-changed" && data?.theme) {
     const name = data.theme;
@@ -2778,7 +2925,7 @@ wrapIpcOn("settings-changed", (_event, type, data) => {
     // 重建托盘菜单，使标签跟随新 locale
     if (tray && !tray.isDestroyed()) {
       const buildMenu = () => Menu.buildFromTemplate([
-        { label: mt("tray.show", null, "Show Hanako"), click: () => showPrimaryWindow() },
+        { label: mt("tray.show", null, "Show HanaAgent"), click: () => showPrimaryWindow() },
         { label: mt("tray.settings", null, "Settings"), click: () => createSettingsWindow() },
         { type: "separator" },
         { label: mt("tray.quit", null, "Quit"), click: () => { isExitingServer = true; isQuitting = true; app.quit(); } },
@@ -3083,6 +3230,20 @@ wrapIpcBestEffortHandler("write-file-binary", (_event, filePath, base64Data) => 
   } catch { return false; }
 });
 
+wrapIpcBestEffortHandler("copy-file", (_event, sourcePath, destinationPath) => {
+  if (!sourcePath || !destinationPath) return false;
+  if (!path.isAbsolute(sourcePath) || !path.isAbsolute(destinationPath)) return false;
+  try {
+    const stat = fs.lstatSync(sourcePath);
+    if (!stat.isFile() || stat.isSymbolicLink()) return false;
+    fs.mkdirSync(path.dirname(destinationPath), { recursive: true });
+    fs.copyFileSync(sourcePath, destinationPath);
+    return true;
+  } catch {
+    return false;
+  }
+});
+
 wrapIpcHandler("screenshot-render", (_event, payload) => {
   return withScreenshotLock(async () => {
     try {
@@ -3101,7 +3262,7 @@ wrapIpcHandler("screenshot-render", (_event, payload) => {
       const pad = (n) => String(n).padStart(2, "0");
       const timestamp = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
       const base = payload.saveDir || path.join(os.homedir(), "Desktop");
-      const dir = path.join(base, "截图");
+      const dir = resolveWorkspaceOutputDir(base, "screenshots", payload.locale || "zh");
       const segmentTotal = Number(payload.segmentTotal);
       const segmentIndex = Number(payload.segmentIndex);
       const segmentSuffix = Number.isInteger(segmentTotal) && segmentTotal > 1 && Number.isInteger(segmentIndex) && segmentIndex > 0
@@ -3281,19 +3442,13 @@ wrapIpcBestEffortHandler("debug-open-onboarding-preview", () => {
   createOnboardingWindow({ preview: "1" });
 });
 
-// Onboarding 完成后，写标记 → 创建主窗口
-wrapIpcHandler("onboarding-complete", () => {
-  const prefsPath = path.join(hanakoHome, "user", "preferences.json");
-  try {
-    let prefs = {};
-    try { prefs = JSON.parse(fs.readFileSync(prefsPath, "utf-8")); } catch {}
-    prefs.setupComplete = true;
-    fs.writeFileSync(prefsPath, JSON.stringify(prefs, null, 2) + "\n", "utf-8");
-  } catch (err) {
-    console.error("[desktop] Failed to write setupComplete:", err);
-  }
-  // 创建主窗口（隐藏），前端 init 完成后通过 app-ready 显示
-  createMainWindow();
+// Onboarding 完成后，经 server PreferencesManager 持久化，成功后才创建主窗口。
+wrapIpcHandler("onboarding-complete", async () => {
+  await completeOnboardingAndOpenMain({
+    serverPort,
+    serverToken,
+    createMainWindow,
+  });
 });
 
 // ── 窗口控制 IPC（Windows/Linux 自绘标题栏用）──
@@ -3351,7 +3506,6 @@ wrapIpcBestEffortHandler("app-ready", () => {
 // ── App 生命周期 ──
 app.whenReady().then(async () => {
   try {
-    migrateSetupComplete();
     _startHiddenAtLogin = getAutoLaunchStatus({ app }).openedAtLogin === true && isSetupComplete();
 
     // 1. 立刻显示启动窗口，同时异步获取 login shell PATH。登录项后台启动时跳过 splash。
@@ -3371,7 +3525,7 @@ app.whenReady().then(async () => {
         startupId: desktopStartupId,
       });
     }
-    console.log("[desktop] 启动 Hanako Server...");
+    console.log("[desktop] 启动 HanaAgent Server...");
     await startServer();
     if (process.platform === "win32") {
       markGpuStartupPhase({
@@ -3397,7 +3551,8 @@ app.whenReady().then(async () => {
     }
 
     // 4. 检测是否需要 onboarding
-    if (isSetupComplete()) {
+    const migratedSetupComplete = await migrateSetupCompleteViaServerIfNeeded();
+    if (isSetupComplete() || migratedSetupComplete) {
       // 已完成配置：直接创建主窗口
       createMainWindow();
       if (process.platform === "win32") {
@@ -3456,13 +3611,12 @@ app.whenReady().then(async () => {
     }
     // 写入 crash.log 并获取详细日志
     const crashInfo = writeCrashLog(err.message);
-    // 截取最后 800 字符放进 dialog（太长会显示不全）
-    const tail = crashInfo.length > 800 ? "...\n" + crashInfo.slice(-800) : crashInfo;
+    const detail = buildLaunchFailureDialogDetail(err, crashInfo);
     dialog.showErrorBox(
-      mt("dialog.launchFailedTitle", null, "Hanako Launch Failed"),
+      mt("dialog.launchFailedTitle", null, "HanaAgent Launch Failed"),
       mt("dialog.launchFailedBody", {
         version: app?.getVersion?.() || "unknown",
-        detail: tail,
+        detail,
         logPath: path.join(hanakoHome, "crash.log"),
       })
     );
@@ -3530,8 +3684,16 @@ async function shutdownServer() {
 
     if (serverProcess === proc) serverProcess = null;
   } else if (reusedServerPid) {
-    console.log("[desktop] shutdownServer: 正在关闭 reused server...");
     const pid = reusedServerPid;
+    if (!reusedServerOwned) {
+      console.log("[desktop] shutdownServer: detached from external server");
+      reusedServerPid = null;
+      reusedServerOwned = false;
+      removeServerInfo = false;
+      return;
+    }
+
+    console.log("[desktop] shutdownServer: 正在关闭 reused server...");
     try {
       await fetch(`http://127.0.0.1:${serverPort}/api/shutdown`, {
         method: "POST",
@@ -3551,7 +3713,10 @@ async function shutdownServer() {
         removeServerInfo = false;
       }
     }
-    if (reusedServerPid === pid) reusedServerPid = null;
+    if (reusedServerPid === pid) {
+      reusedServerPid = null;
+      reusedServerOwned = false;
+    }
   }
   // 清理 server-info.json，防止更新后新版 Electron 误连旧 server
   if (removeServerInfo) {
@@ -3583,7 +3748,7 @@ app.on("before-quit", async (event) => {
   _currentBrowserSession = null;
 
   // server 清理
-  if ((serverProcess && !hasChildExitObserved(serverProcess)) || reusedServerPid) {
+  if ((serverProcess && !hasChildExitObserved(serverProcess)) || (reusedServerPid && reusedServerOwned)) {
     event.preventDefault();
     await shutdownServer();
     app.quit();

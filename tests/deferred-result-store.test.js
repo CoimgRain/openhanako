@@ -61,6 +61,25 @@ describe("DeferredResultStore", () => {
     });
   });
 
+  describe("retry", () => {
+    it("reopens a failed task as pending with fresh metadata", () => {
+      store.defer("t1", "/s/a", { type: "image-generation", prompt: "old" });
+      store.fail("t1", "API returned no images");
+
+      store.retry("t1", "/s/a", { type: "image-generation", prompt: "new" });
+
+      expect(store.query("t1")).toMatchObject({
+        status: "pending",
+        sessionPath: "/s/a",
+        meta: { type: "image-generation", prompt: "new" },
+        result: null,
+        reason: null,
+        delivered: false,
+      });
+      expect(store.listPending("/s/a").map((task) => task.taskId)).toEqual(["t1"]);
+    });
+  });
+
   describe("listPending", () => {
     it("returns only pending tasks for the given session", () => {
       store.defer("t1", "/s/a", {});
@@ -82,6 +101,34 @@ describe("DeferredResultStore", () => {
       expect(store.query("t1")).toBeNull();
       expect(store.query("t2")).toBeNull();
       expect(store.query("t3")).not.toBeNull();
+    });
+  });
+
+  describe("suppressBySession", () => {
+    it("aborts pending tasks and marks undelivered terminal tasks as suppressed", () => {
+      store.defer("pending", "/s/a", {});
+      store.defer("resolved", "/s/a", {});
+      store.resolve("resolved", "done");
+      store.defer("other", "/s/b", {});
+
+      const result = store.suppressBySession("/s/a", "parent session archived");
+
+      expect(result).toMatchObject({ aborted: 1, suppressed: 1 });
+      expect(store.query("pending")).toMatchObject({
+        status: "aborted",
+        delivered: true,
+        deliverySuppressed: true,
+        reason: "parent session archived",
+      });
+      expect(store.query("resolved")).toMatchObject({
+        status: "resolved",
+        delivered: true,
+        deliverySuppressed: true,
+      });
+      expect(store.query("other")).toMatchObject({
+        status: "pending",
+        delivered: false,
+      });
     });
   });
 
