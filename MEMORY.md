@@ -219,3 +219,27 @@
 - 改动：`core/session-coordinator.js` 在 `executeIsolated` 收到显式 `opts.model` 时先尝试解析；如果该模型不可用，记录 warn 并回退到目标 agent 的 `models.chat` 或 default model，而不是让子代理任务失败。`tests/session-coordinator.test.js` 增加覆盖：子代理传入不可用模型时应回退到可用模型继续创建 isolated session。
 - 验证：已运行 `npm test -- tests/session-coordinator.test.js`，35 个测试通过；已用 Node 25.8.1 重启开发版，14501 端口已监听，正式版 14500 未被杀；最新开发日志未再出现 better-sqlite ABI、runtime init 或 `找不到模型: deepseek/deepseek-chat` 错误。
 - 风险/后续：历史已经失败的子代理 run 仍会保留失败记录；新派发的子代理会走模型回退逻辑。
+
+## 2026-05-21 05:37
+
+- 目标：把当前已提交版本构建并安装成本机可直接打开的 `Hanako Plus.app`。
+- 背景：用户要求将当前修复好的版本打包成 Plus；本机 Plus 约定是 `/Applications/Hanako Plus.app`，保留 `com.hanako.app` 和正式数据目录以继承原有聊天记录与配置。
+- 改动：先停止开发版 14501，不动正式数据；运行 `npm run pack`，首次因 Swift 旧路径模块缓存失败，清理 `.cache/computer-use-helper/swift-build/mac-arm64` 和 `dist-computer-use/mac-arm64` 后重跑；`electron-builder` 在最后 notarize 因缺少 Apple 密码报错，但 `dist/mac-arm64/Hanako.app` 已生成。随后复制为 `/Applications/Hanako Plus.app`，设置 `CFBundleDisplayName=Hanako Plus`，保留 `CFBundleName=Hanako` 与 `CFBundleIdentifier=com.hanako.app`，写入 `app-update.yml`，移除 quarantine，并对 server node/native addon、computer-use helper、framework/helper 和主 app 做 ad-hoc 重签。
+- 验证：`codesign --verify --deep --strict /Applications/Hanako\ Plus.app` 通过；启动 `/Applications/Hanako Plus.app` 后 server 进程来自 Plus app，监听 14500；使用 `/Users/kang/.hanako/server-info.json` token 请求 `/api/health` 返回 `status: ok`、版本 `0.222.8`。
+- 风险/后续：本地 ad-hoc 签名未 notarize，适合本机使用；若要分发给其他机器，需要配置 Apple notarization 密码后走正式签名流程。
+
+## 2026-05-21 08:12
+
+- 目标：按用户澄清把 A1 服务器配置为 Hanako Plus 的公网桥接入口，而不是把 Hanako 部署到服务器。
+- 背景：用户希望手机在外网访问时，本质仍连接这台 Mac 上的 `/Applications/Hanako Plus.app` 与本机正式端口 `14500`；A1 只承担公网 nginx 入口和 SSH 反向隧道转发。
+- 改动：确认并保留本机 LaunchAgent `/Users/kang/Library/LaunchAgents/com.hanako.a1-bridge.plist`，通过 `ssh -R 127.0.0.1:18649:127.0.0.1:14500 a1` 把 A1 本地端口转回 Mac 的 Plus 服务；A1 nginx 当前使用公网 `http://47.110.74.238:8648` 转发到 `127.0.0.1:18649`；本地连接信息文件 `/Users/kang/.hanako/a1-bridge-access.txt` 已改为 `8648` 并保持 `600` 权限。
+- 验证：`launchctl print gui/$(id -u)/com.hanako.a1-bridge` 显示 running；本机存在 ssh 反向隧道进程；`curl -I http://47.110.74.238:8648/mobile/` 返回 `HTTP/1.1 200 OK`；带本地生成的 device credential 请求 `http://47.110.74.238:8648/api/server/identity` 返回 `credentialKind: device_credential`、`capabilities: [chat, resources, files]`、`version: 0.222.8`。
+- 风险/后续：公网 `8649` 端口疑似被云安全组拦截，所以当前稳定入口临时复用 `8648`；若后续需要更干净的独立端口或域名 HTTPS，应打开云安全组或绑定域名证书。旧 Hermes 8648 nginx 配置已备份在 A1 的 `/root/nginx-backups/`。
+
+## 2026-05-21 11:28
+
+- 目标：按用户要求从个人知识库找回“双 Mac 通过 A1 SSH 中转”的方案，并执行最后一步。
+- 背景：知识库笔记 `MacBook Pro与MacBook Air SSH连接` 记录最终步骤是补齐 Pro 侧 SSH 别名，形成 `Pro -> A1 -> Air` 固定入口；当前本机确认为 MacBook Pro，`a1` SSH 别名可用。
+- 改动：在 `/Users/kang/.ssh/config` 新增 `Host air-via-a1`，通过 `ProxyJump a1` 访问 A1 上的 `127.0.0.1:22022`，用户为 `kang`，使用现有 `~/.ssh/sortify_server` key，并设置 SSH keepalive 与 `HostKeyAlias macbook-air-via-a1`。
+- 验证：`ssh -G air-via-a1` 已确认别名解析为 `ProxyJump a1`、目标 `127.0.0.1:22022`；`ssh a1` 可登录。实际 `ssh air-via-a1` 当前因 A1 上未检测到 Air 反向隧道监听 `22022` 而 `Connection refused`，说明 Pro 侧最后一步已补齐，但 Air 侧隧道需要在线后才能连通。
+- 风险/后续：未修改 `TODO.md`；若 Air 侧端口不是 `22022` 或 Air 登录用户名/授权 key 不同，需按实际 Air 侧配置调整该别名。
