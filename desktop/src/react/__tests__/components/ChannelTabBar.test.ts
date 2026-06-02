@@ -1,6 +1,19 @@
 // @vitest-environment jsdom
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+const { hydrateCurrentChannelIfNeededMock, loadChannelsMock, openChannelMock } = vi.hoisted(() => ({
+  hydrateCurrentChannelIfNeededMock: vi.fn(() => Promise.resolve()),
+  loadChannelsMock: vi.fn(),
+  openChannelMock: vi.fn(),
+}));
+
+vi.mock('../../stores/channel-actions', () => ({
+  hydrateCurrentChannelIfNeeded: hydrateCurrentChannelIfNeededMock,
+  loadChannels: loadChannelsMock,
+  openChannel: openChannelMock,
+}));
+
 import { switchTab } from '../../components/channels/ChannelTabBar';
 import { useStore } from '../../stores';
 
@@ -28,12 +41,15 @@ describe('ChannelTabBar switchTab', () => {
     });
     useStore.setState({
       currentTab: 'chat',
+      currentChannel: null,
+      channelIsDM: false,
       sidebarOpen: true,
       sidebarAutoCollapsed: false,
       jianOpen: true,
       jianAutoCollapsed: false,
       activePanel: null,
     } as never);
+    vi.clearAllMocks();
   });
 
   it('keeps the right workspace companion state independent from tab switches', () => {
@@ -49,5 +65,28 @@ describe('ChannelTabBar switchTab', () => {
 
     expect(useStore.getState().currentTab).toBe('plugin:other-plugin');
     expect(useStore.getState().jianOpen).toBe(true);
+  });
+
+  it('refreshes the selected channel when entering the channels tab', () => {
+    useStore.setState({
+      currentTab: 'chat',
+      currentChannel: 'ch_crew',
+      channelIsDM: false,
+    } as never);
+
+    switchTab('channels');
+
+    expect(useStore.getState().currentTab).toBe('channels');
+    expect(hydrateCurrentChannelIfNeededMock).toHaveBeenCalledTimes(1);
+    expect(openChannelMock).toHaveBeenCalledWith('ch_crew', false);
+    expect(loadChannelsMock).not.toHaveBeenCalled();
+  });
+
+  it('refreshes the channel list when entering channels without a selection', () => {
+    switchTab('channels');
+
+    expect(hydrateCurrentChannelIfNeededMock).toHaveBeenCalledTimes(1);
+    expect(loadChannelsMock).toHaveBeenCalledTimes(1);
+    expect(openChannelMock).not.toHaveBeenCalled();
   });
 });

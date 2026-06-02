@@ -129,6 +129,113 @@ describe("skills route", () => {
     expect(engine.emitEvent).not.toHaveBeenCalled();
   });
 
+  it("merges concurrent single-skill delta writes for the same agent", async () => {
+    const agentId = "hana";
+    const agentDir = path.join(tempRoot, agentId);
+    fs.mkdirSync(agentDir, { recursive: true });
+    fs.writeFileSync(path.join(agentDir, "config.yaml"), "agent:\n  name: Hana\n", "utf-8");
+
+    const { createSkillsRoute } = await import("../server/routes/skills.js");
+    const app = new Hono();
+    let enabled = [];
+    const engine = {
+      agentsDir: tempRoot,
+      getAllSkills: vi.fn(() => [
+        { name: "writer", enabled: enabled.includes("writer") },
+        { name: "reader", enabled: enabled.includes("reader") },
+      ]),
+      getAgent: vi.fn(() => ({ id: agentId })),
+      updateConfig: vi.fn(async (partial) => {
+        await Promise.resolve();
+        enabled = partial.skills.enabled;
+      }),
+      emitEvent: vi.fn(),
+    };
+
+    app.route("/api", createSkillsRoute(engine));
+
+    const [writerRes, readerRes] = await Promise.all([
+      app.request(`/api/agents/${agentId}/skills/writer`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled: true }),
+      }),
+      app.request(`/api/agents/${agentId}/skills/reader`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled: true }),
+      }),
+    ]);
+
+    expect(writerRes.status).toBe(200);
+    expect(readerRes.status).toBe(200);
+    expect(enabled).toEqual(["writer", "reader"]);
+    expect(engine.updateConfig).toHaveBeenLastCalledWith({
+      skills: { enabled: ["writer", "reader"] },
+    }, { agentId });
+    expectAppEvent(engine.emitEvent, "skills-changed", { agentId });
+    expect(engine.emitEvent).toHaveBeenCalledTimes(2);
+  });
+
+  it("enables a skill bundle through a serialized per-agent delta write", async () => {
+    const agentId = "hana";
+    const agentDir = path.join(tempRoot, agentId);
+    fs.mkdirSync(agentDir, { recursive: true });
+    fs.writeFileSync(path.join(agentDir, "config.yaml"), "agent:\n  name: Hana\n", "utf-8");
+    fs.writeFileSync(path.join(tempRoot, "skill-bundles.json"), JSON.stringify({
+      schemaVersion: 1,
+      bundles: [
+        {
+          id: "writing-bundle",
+          name: "Writing Bundle",
+          skillNames: ["writer", "reader", "missing-skill"],
+          source: "user",
+          agentId: null,
+          sourcePackage: null,
+          createdAt: "2026-05-21T00:00:00.000Z",
+          updatedAt: "2026-05-21T00:00:00.000Z",
+        },
+      ],
+    }), "utf-8");
+
+    const { createSkillsRoute } = await import("../server/routes/skills.js");
+    const app = new Hono();
+    let enabled = ["existing"];
+    const engine = {
+      hanakoHome: tempRoot,
+      agentsDir: tempRoot,
+      getAllSkills: vi.fn(() => [
+        { name: "existing", enabled: enabled.includes("existing") },
+        { name: "writer", enabled: enabled.includes("writer") },
+        { name: "reader", enabled: enabled.includes("reader") },
+      ]),
+      getAgent: vi.fn(() => ({ id: agentId })),
+      updateConfig: vi.fn(async (partial) => {
+        enabled = partial.skills.enabled;
+      }),
+      emitEvent: vi.fn(),
+    };
+
+    app.route("/api", createSkillsRoute(engine));
+
+    const res = await app.request(`/api/agents/${agentId}/skill-bundles/writing-bundle`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled: true }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      ok: true,
+      enabled: ["existing", "writer", "reader"],
+      changed: ["writer", "reader"],
+    });
+    expect(engine.updateConfig).toHaveBeenCalledWith({
+      skills: { enabled: ["existing", "writer", "reader"] },
+    }, { agentId });
+    expectAppEvent(engine.emitEvent, "skills-changed", { agentId });
+  });
+
   it("emits global skills-changed after reloading skills", async () => {
     const { createSkillsRoute } = await import("../server/routes/skills.js");
     const app = new Hono();
@@ -474,7 +581,9 @@ describe("skills route", () => {
     const srcDir = path.join(tempRoot, "incoming-skill");
     const userSkillsDir = path.join(tempRoot, "user-skills");
     fs.mkdirSync(srcDir, { recursive: true });
+    fs.mkdirSync(path.join(srcDir, "references"), { recursive: true });
     fs.writeFileSync(path.join(srcDir, "SKILL.md"), "---\nname: sample-skill\n---\n# Sample\n", "utf-8");
+    fs.writeFileSync(path.join(srcDir, "references", "guide.md"), "# Guide\n", "utf-8");
     const sessionPath = "/sessions/install-source.jsonl";
     const registerSessionFile = vi.fn(({ sessionPath, filePath, label, origin, storageKind }) => ({
       id: "sf_skill_source",
@@ -519,6 +628,7 @@ describe("skills route", () => {
       origin: "skill_install_source",
       storageKind: "install_source",
     });
+    expect(fs.existsSync(path.join(userSkillsDir, "sample-skill", "references", "guide.md"))).toBe(true);
     expect(data).toMatchObject({
       ok: true,
       skill: { name: "sample-skill" },
@@ -575,7 +685,7 @@ describe("DELETE /skills/:name — per-agent target selection", () => {
     };
   }
 
-  function writeLearnedSkill(agentId, skillName) {
+  function writeLegacyLearnedSkill(agentId, skillName) {
     const dir = path.join(agentsDir, agentId, "learned-skills", skillName);
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(path.join(dir, "SKILL.md"), `---\nname: ${skillName}\n---\n`, "utf-8");
@@ -632,12 +742,12 @@ describe("DELETE /skills/:name — per-agent target selection", () => {
     expect(engine.reloadSkills).toHaveBeenCalled();
   });
 
-  it("显式 agentId: learned skill 在指定 agent 的 learned-skills 目录被删除", async () => {
+  it("显式 agentId: legacy learned-skills 目录不再作为删除目标", async () => {
     const engine = buildEngine({
       agents: ["agent-a", "agent-b"],
       currentAgentId: "agent-a",
     });
-    const learnedDir = writeLearnedSkill("agent-b", "test-skill");
+    const learnedDir = writeLegacyLearnedSkill("agent-b", "test-skill");
     expect(fs.existsSync(learnedDir)).toBe(true);
 
     const { createSkillsRoute } = await import("../server/routes/skills.js");
@@ -645,18 +755,18 @@ describe("DELETE /skills/:name — per-agent target selection", () => {
     app.route("/api", createSkillsRoute(engine));
 
     const res = await app.request("/api/skills/test-skill?agentId=agent-b", { method: "DELETE" });
-    expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ ok: true });
-    expect(fs.existsSync(learnedDir)).toBe(false);
+    expect(res.status).toBe(404);
+    expect(fs.existsSync(learnedDir)).toBe(true);
   });
 
-  it("核心回归 (#419): 同名 learned skill 在两个 agent 下时只删除指定 agent 的", async () => {
+  it("显式 agentId: 用户级 skill 被删除,且不会触碰 legacy learned-skills 同名目录", async () => {
     const engine = buildEngine({
       agents: ["agent-a", "agent-b"],
-      currentAgentId: "agent-a", // 焦点在 a, 但要删 b
+      currentAgentId: "agent-a",
     });
-    const dirA = writeLearnedSkill("agent-a", "dup-skill");
-    const dirB = writeLearnedSkill("agent-b", "dup-skill");
+    writeUserSkill("dup-skill");
+    const dirA = writeLegacyLearnedSkill("agent-a", "dup-skill");
+    const dirB = writeLegacyLearnedSkill("agent-b", "dup-skill");
     expect(fs.existsSync(dirA)).toBe(true);
     expect(fs.existsSync(dirB)).toBe(true);
 
@@ -668,10 +778,9 @@ describe("DELETE /skills/:name — per-agent target selection", () => {
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ ok: true });
 
-    // agent-b 的被删; agent-a 的必须完好无损 — 这是 #419 级别的回归
-    expect(fs.existsSync(dirB)).toBe(false);
+    expect(fs.existsSync(path.join(skillsDir, "dup-skill"))).toBe(false);
+    expect(fs.existsSync(dirB)).toBe(true);
     expect(fs.existsSync(dirA)).toBe(true);
-    expect(fs.existsSync(path.join(dirA, "SKILL.md"))).toBe(true);
   });
 
   it("显式 agentId: 用户级 skill 被删除,且所有 agent 的 enabled 列表都被清理", async () => {

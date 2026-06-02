@@ -42,8 +42,9 @@ export const UserMessage = memo(function UserMessage({
   const userAvatarUrl = useStore(s => s.userAvatarUrl);
   const t = window.t ?? ((p: string) => p);
   const storeUserName = useStore(s => s.userName) || t('common.me');
-  const userName = userIdentity?.name || storeUserName;
-  const displayAvatarUrl = userIdentity ? (userIdentity.avatarUrl || null) : userAvatarUrl;
+  const useIdentityOverride = !!userIdentity && message.source !== 'desktop';
+  const userName = useIdentityOverride ? (userIdentity?.name || storeUserName) : storeUserName;
+  const displayAvatarUrl = useIdentityOverride ? (userIdentity?.avatarUrl || null) : userAvatarUrl;
   const userDisplayInfo = useMemo(() => resolveAgentDisplayInfo({
     id: 'user',
     agents: [],
@@ -274,7 +275,7 @@ const UserAttachmentsView = memo(function UserAttachmentsView({ attachments, des
                     messageId,
                   });
                 }}
-                style={{ cursor: 'pointer' }}
+                style={{ cursor: 'default' }}
               />
               {att.visionAuxiliary && (
                 <div className={styles.visionAuxiliaryLabel}>

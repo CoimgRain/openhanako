@@ -9,13 +9,164 @@
     -webkit-app-region: no-drag;
 }
 
+.sessionListScroller {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    -webkit-app-region: no-drag;
+}
+
+.sessionSearchBox {
+    position: relative;
+    z-index: 1;
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    height: 30px;
+    margin: 15px var(--space-sm) 6px;
+    padding: 0 8px;
+    background: color-mix(in srgb, var(--sidebar-bg, var(--bg)) 97%, var(--text) 3%);
+    border: none;
+    border-radius: var(--radius-sm);
+    -webkit-app-region: no-drag;
+}
+
+.sessionSearchBox::before {
+    content: "";
+    position: absolute;
+    left: 50%;
+    top: -10px;
+    width: 184px;
+    height: 1px;
+    transform: translateX(-50%);
+    background: color-mix(in srgb, var(--text-muted) 18%, transparent);
+    pointer-events: none;
+}
+
+.sessionSearchIcon {
+    flex-shrink: 0;
+    color: var(--text-muted);
+    opacity: 0.62;
+}
+
+.sessionSearchInput {
+    flex: 1;
+    min-width: 0;
+    height: 24px;
+    border: none;
+    outline: none;
+    background: transparent;
+    color: var(--text);
+    font-family: inherit;
+    font-size: 0.76rem;
+    line-height: 24px;
+}
+
+.sessionSearchInput::placeholder {
+    color: var(--text-muted);
+    opacity: 0.64;
+}
+
+:global(.mobile-desktop-root) .sessionSearchInput {
+    font-size: 16px;
+}
+
+.sessionSearchClear {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    width: 20px;
+    height: 20px;
+    padding: 0;
+    border: none;
+    border-radius: 3px;
+    background: transparent;
+    color: var(--text-muted);
+    cursor: default;
+}
+
+.sessionSearchClear:hover,
+.sessionSearchClear:focus-visible {
+    color: var(--accent);
+    background: var(--accent-light);
+    outline: none;
+}
+
+.sessionSearchSection {
+    margin: 0;
+    padding: 0;
+}
+
+.sessionSearchSectionTitle {
+    font-size: 0.65rem;
+    font-weight: 600;
+    color: var(--text-muted);
+    letter-spacing: 0;
+    padding: var(--space-sm) var(--space-sm) 2px;
+    opacity: 0.72;
+    user-select: none;
+}
+
+.sessionSearchItem {
+    display: flex;
+    flex-direction: column;
+    padding: 6px var(--space-sm);
+    margin-bottom: 1px;
+    border-radius: var(--radius-sm);
+    cursor: default;
+    transition: background var(--duration-fast), color var(--duration-fast);
+    -webkit-app-region: no-drag;
+    border: none;
+    background: none;
+    width: 100%;
+    text-align: left;
+    font-family: inherit;
+    overflow: hidden;
+}
+
+@media (hover: hover) and (pointer: fine) {
+    .sessionSearchItem:hover {
+        background: var(--accent-light);
+    }
+}
+
+.sessionSearchItemActive {
+    background: var(--accent-light);
+}
+
+.sessionSearchItemActive .sessionItemTitle {
+    color: var(--accent);
+    font-weight: 600;
+}
+
+.sessionSearchSnippet {
+    margin-top: 4px;
+    color: var(--text-muted);
+    font-size: 0.68rem;
+    line-height: 1.45;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+}
+
+.sessionSearchStatus,
+.sessionSearchEmpty {
+    padding: 10px var(--space-sm);
+    color: var(--text-muted);
+    font-size: 0.72rem;
+    line-height: 1.5;
+}
+
 .sessionItem {
     display: flex;
     flex-direction: column;
     padding: 6px var(--space-sm);
     margin-bottom: 1px;
     border-radius: var(--radius-sm);
-    cursor: pointer;
+    cursor: default;
     transition: background var(--duration-fast), color var(--duration-fast);
     -webkit-app-region: no-drag;
     border: none;
@@ -37,6 +188,15 @@
     background: var(--accent-light);
 }
 
+.sessionItemChild {
+    width: calc(100% - 10px);
+    margin-left: 10px;
+}
+
+.sessionItemReadOnly {
+    --session-item-readonly: 1;
+}
+
 .sessionItemTitle {
     font-size: 0.8rem;
     color: var(--text);
@@ -45,6 +205,7 @@
     text-overflow: ellipsis;
     white-space: nowrap;
     min-width: 0;
+    flex: 1 1 auto;
 }
 
 .sessionItemActive .sessionItemTitle {
@@ -63,8 +224,37 @@
     transition: padding-right var(--duration-fast);
 }
 
+.sessionItemMetaSep {
+    opacity: 0.9;
+}
+
+.sessionTaskDuration {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 4px;
+}
+
+.sessionTaskDurationTime {
+    display: inline-block;
+    width: 5ch;
+    font-family: var(--font-mono, "SFMono-Regular", "SF Mono", Consolas, monospace);
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: "tnum";
+    text-align: left;
+}
+
+.sessionRelativeTime {
+    font-family: var(--font-mono, "SFMono-Regular", "SF Mono", Consolas, monospace);
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: "tnum";
+}
+
+.sessionItemMetaCollaboration {
+    margin-left: 18px;
+}
+
 @media (hover: hover) and (pointer: fine) {
-    .sessionItem:hover .sessionItemMeta {
+    .sessionItem:not(.sessionItemReadOnly):hover .sessionItemMeta {
         padding-right: 68px;
     }
 }
@@ -101,7 +291,7 @@
     border: none;
     border-radius: 3px;
     color: var(--text-muted);
-    cursor: pointer;
+    cursor: default;
     opacity: 0;
     pointer-events: none;
     transition: all var(--duration-fast);
@@ -138,7 +328,7 @@
     border: none;
     border-radius: 3px;
     color: var(--text-muted);
-    cursor: pointer;
+    cursor: default;
     opacity: 0;
     pointer-events: none;
     transition: all var(--duration-fast);
@@ -200,7 +390,7 @@
     border: none;
     border-radius: 3px;
     color: var(--danger);
-    cursor: pointer;
+    cursor: default;
     opacity: 0;
     pointer-events: none;
     transition: all var(--duration-fast);
@@ -223,7 +413,7 @@
     }
 }
 
-.sessionItemActive .sessionItemMeta,
+.sessionItemActive:not(.sessionItemReadOnly) .sessionItemMeta,
 .sessionItem:focus-visible .sessionItemMeta {
     padding-right: 68px;
 }
@@ -238,16 +428,6 @@
     pointer-events: auto;
 }
 
-/* streaming 呼吸动画 */
-.sessionStreamingDot {
-    width: 5px;
-    height: 5px;
-    border-radius: 50%;
-    background: var(--accent, #b89a7a);
-    flex-shrink: 0;
-    animation: hana-pulse 2s ease-in-out infinite;
-}
-
 /* 浏览器标记 */
 .sessionBrowserBadge {
     position: absolute;
@@ -260,7 +440,7 @@
     height: 18px;
     color: var(--text-muted);
     opacity: 0.5;
-    cursor: pointer;
+    cursor: default;
     pointer-events: auto;
     border-radius: 3px;
     transition: color var(--duration-fast), background var(--duration-fast), opacity var(--duration-fast);
@@ -286,6 +466,25 @@
     object-fit: cover;
     flex-shrink: 0;
     pointer-events: none;
+}
+
+.sessionAgentPairBadge {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    flex-shrink: 0;
+    pointer-events: none;
+}
+
+.sessionDelegationArrow {
+    width: 16px;
+    height: 16px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--text-muted);
+    flex-shrink: 0;
+    opacity: 0.72;
 }
 
 .sessionAgentBadgeText {
@@ -416,4 +615,167 @@
     padding: var(--space-lg) var(--space-sm);
     color: var(--text-muted);
     font-size: 0.78rem;
+}
+
+.sessionCountdown {
+    position: absolute;
+    top: 5px;
+    right: 6px;
+    width: 16px;
+    height: 16px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    pointer-events: none;
+}
+
+.sessionCountdown svg {
+    display: block;
+    transform: rotate(-90deg);
+}
+
+.sessionCountdownCheck {
+    position: absolute;
+    inset: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    color: currentColor;
+}
+
+.sessionCountdownDone .sessionCountdownCheck {
+    opacity: 0;
+    transform: scale(0.62);
+    animation: hana-subagent-check-pop 180ms ease-out 520ms forwards;
+}
+
+.sessionCountdownCheck svg {
+    transform: none;
+}
+
+.sessionCountdownTrack,
+.sessionCountdownValue,
+.sessionCountdownSpinner {
+    fill: none;
+    stroke-width: 1.6;
+}
+
+.sessionCountdownTrack {
+    stroke: rgba(var(--accent-rgb), 0.12);
+}
+
+.sessionCountdownValue {
+    stroke: currentColor;
+    stroke-linecap: round;
+    transition: stroke-dashoffset 1s linear, color var(--duration-fast);
+}
+
+.sessionCountdownSpinner {
+    stroke: currentColor;
+    stroke-linecap: round;
+}
+
+.sessionCountdownRunning {
+    color: var(--accent);
+}
+
+.sessionCountdownRunning svg {
+    animation: hana-subagent-ring-spin 900ms linear infinite;
+}
+
+.sessionCountdownDone > svg {
+    animation: hana-subagent-complete-spin 560ms cubic-bezier(0.2, 0.72, 0.18, 1) both;
+}
+
+.sessionCountdownDismissing {
+    animation: hana-session-check-dismiss-fade 560ms ease-in forwards;
+}
+
+.sessionCountdownDismissing > svg {
+    animation: hana-session-check-dismiss-spin 560ms cubic-bezier(0.2, 0.72, 0.18, 1) forwards;
+}
+
+.sessionCountdownDismissing .sessionCountdownCheck {
+    animation: hana-session-check-dismiss-check 180ms ease-in forwards;
+}
+
+.sessionCountdownSafe {
+    color: var(--accent);
+}
+
+.sessionCountdownWarn {
+    color: #d6a21f;
+}
+
+.sessionCountdownDanger {
+    color: var(--danger);
+}
+
+@keyframes hana-subagent-ring-spin {
+    from {
+        transform: rotate(-90deg);
+    }
+    to {
+        transform: rotate(270deg);
+    }
+}
+
+@keyframes hana-subagent-complete-spin {
+    from {
+        transform: rotate(-90deg);
+    }
+    to {
+        transform: rotate(270deg);
+    }
+}
+
+@keyframes hana-subagent-check-pop {
+    0% {
+        opacity: 0;
+        transform: scale(0.62);
+    }
+    72% {
+        opacity: 1;
+        transform: scale(1.14);
+    }
+    100% {
+        opacity: 1;
+        transform: scale(1);
+    }
+}
+
+@keyframes hana-session-check-dismiss-fade {
+    0% {
+        opacity: 1;
+        transform: scale(1);
+    }
+    68% {
+        opacity: 1;
+        transform: scale(1);
+    }
+    100% {
+        opacity: 0;
+        transform: scale(0.86);
+    }
+}
+
+@keyframes hana-session-check-dismiss-spin {
+    from {
+        transform: rotate(-90deg);
+    }
+    to {
+        transform: rotate(270deg);
+    }
+}
+
+@keyframes hana-session-check-dismiss-check {
+    from {
+        opacity: 1;
+        transform: scale(1);
+    }
+    to {
+        opacity: 0;
+        transform: scale(0.72);
+    }
 }

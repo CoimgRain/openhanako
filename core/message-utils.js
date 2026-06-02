@@ -7,6 +7,7 @@ import fs from "fs/promises";
 import path from "path";
 import { isToolCallBlock, getToolArgs } from "./llm-utils.js";
 import { SessionManager } from "../lib/pi-sdk/index.js";
+import { DEFERRED_RESULT_RECORD_TYPE } from "../lib/deferred-result-notification.js";
 
 /**
  * 工具调用参数摘要键列表
@@ -18,6 +19,7 @@ export const TOOL_ARG_SUMMARY_KEYS = [
 ];
 
 const SESSION_TAIL_READ_THRESHOLD = 256 * 1024;
+const ATTACHED_IMAGE_MARKER_RE = /\[attached_image:\s*[^\]]+\]/g;
 
 /** 从文本中提取并剥离 <think>/<thinking> 标签 */
 export function stripThinkTags(raw) {
@@ -72,6 +74,14 @@ export function extractTextContent(content, { stripThink = false } = {}) {
   return { text, thinking, toolUses, images };
 }
 
+export function filterUnreferencedInlineImages(text, images) {
+  if (!Array.isArray(images) || images.length === 0) return [];
+  const markerCount = String(text || "").match(ATTACHED_IMAGE_MARKER_RE)?.length || 0;
+  if (markerCount <= 0) return images;
+  if (markerCount >= images.length) return [];
+  return images.slice(markerCount);
+}
+
 /**
  * 优先从 session JSONL 读取完整历史。
  * engine.messages 可能只是当前上下文窗口，切回页面时会导致旧消息缺失。
@@ -87,11 +97,8 @@ export async function loadSessionHistoryMessages(engine, explicitPath) {
       const branch = manager.getBranch();
       const messages = [];
       for (const entry of branch) {
-        if (entry.type !== "message" || !entry.message) continue;
-        const message = { ...entry.message };
-        if (entry.id) message.id = entry.id;
-        if (entry.timestamp) message.timestamp = entry.timestamp;
-        messages.push(message);
+        const message = historyMessageFromEntry(entry);
+        if (message) messages.push(message);
       }
       if (messages.length > 0) return messages;
     }
@@ -107,12 +114,8 @@ export async function loadSessionHistoryMessages(engine, explicitPath) {
       if (!line.trim()) continue;
       try {
         const entry = JSON.parse(line);
-        if (entry.type === "message" && entry.message) {
-          const message = { ...entry.message };
-          if (entry.id) message.id = entry.id;
-          if (entry.timestamp) message.timestamp = entry.timestamp;
-          messages.push(message);
-        }
+        const message = historyMessageFromEntry(entry);
+        if (message) messages.push(message);
       } catch {
         // 跳过损坏行
       }
@@ -124,6 +127,39 @@ export async function loadSessionHistoryMessages(engine, explicitPath) {
   }
 
   return [];
+}
+
+function historyMessageFromEntry(entry) {
+  if (entry?.type === "message" && entry.message) {
+    const message = { ...entry.message };
+    if (entry.id) message.id = entry.id;
+    if (entry.timestamp) message.timestamp = entry.timestamp;
+    return message;
+  }
+  if (entry?.type === "custom_message" && entry.customType) {
+    const message = {
+      role: "custom",
+      customType: entry.customType,
+      content: entry.content || "",
+      display: entry.display,
+      ...(entry.details !== undefined ? { details: entry.details } : {}),
+    };
+    if (entry.id) message.id = entry.id;
+    if (entry.timestamp) message.timestamp = entry.timestamp;
+    return message;
+  }
+  if (entry?.type === "custom" && entry.customType === DEFERRED_RESULT_RECORD_TYPE) {
+    const message = {
+      role: "custom",
+      customType: entry.customType,
+      data: entry.data,
+      display: false,
+    };
+    if (entry.id) message.id = entry.id;
+    if (entry.timestamp) message.timestamp = entry.timestamp;
+    return message;
+  }
+  return null;
 }
 
 async function looksLikePiSessionFile(sessionPath) {
@@ -222,22 +258,56 @@ export function isValidSessionPath(sessionPath, baseDir) {
   return relativePathInsideBase(sessionPath, baseDir) !== null;
 }
 
-/**
- * 严格校验：sessionPath 必须指向某 agent 的"活跃/归档"对话文件，
- * 即落在 `agents/{id}/sessions/xxx.jsonl` 或 `agents/{id}/sessions/archived/xxx.jsonl`。
- *
- * 明确拒绝旁路目录（subagent-sessions/、activity/、heartbeat/、.ephemeral/ 等）。
- * 这些目录下的 session 文件是 agent 运行态产物，不是用户可切换的对话焦点——把它们
- * 当成活跃 session 会让 listSessions 的"伪条目"分支伪造出"新对话"幻影条目（不能归档、
- * 重启即消失），参见 session-coordinator listSessions 占位逻辑。
- */
-export function isActiveSessionPath(sessionPath, agentsDir) {
+function desktopSessionParts(sessionPath, agentsDir) {
   const rel = relativePathInsideBase(sessionPath, agentsDir);
   if (rel === null) return false;
   const parts = rel.split(path.sep);
-  if (parts.length < 3) return false;
+  if (!parts[0] || !parts[1]) return false;
+  return parts;
+}
+
+function isJsonlFileName(name) {
+  return typeof name === "string" && name.endsWith(".jsonl") && path.basename(name) === name;
+}
+
+/**
+ * Active desktop sessions are the only paths allowed to run model turns or
+ * receive background delivery: `agents/{id}/sessions/*.jsonl`.
+ */
+export function isActiveDesktopSessionPath(sessionPath, agentsDir) {
+  const parts = desktopSessionParts(sessionPath, agentsDir);
+  if (!parts || parts.length !== 3) return false;
   if (parts[1] !== "sessions") return false;
-  if (parts.length === 3) return true;
-  if (parts.length === 4 && parts[2] === "archived") return true;
-  return false;
+  return isJsonlFileName(parts[2]);
+}
+
+/**
+ * Archived desktop sessions are readable/restorable lifecycle objects:
+ * `agents/{id}/sessions/archived/*.jsonl`. They are not runnable.
+ */
+export function isArchivedDesktopSessionPath(sessionPath, agentsDir) {
+  const parts = desktopSessionParts(sessionPath, agentsDir);
+  if (!parts || parts.length !== 4) return false;
+  if (parts[1] !== "sessions" || parts[2] !== "archived") return false;
+  return isJsonlFileName(parts[3]);
+}
+
+export function isDesktopSessionPath(sessionPath, agentsDir) {
+  return isActiveDesktopSessionPath(sessionPath, agentsDir)
+    || isArchivedDesktopSessionPath(sessionPath, agentsDir);
+}
+
+/**
+ * Backward-compatible name used by older call sites. It is intentionally
+ * active-only now; archived sessions must go through restore/read/delete flows.
+ */
+export function isActiveSessionPath(sessionPath, agentsDir) {
+  return isActiveDesktopSessionPath(sessionPath, agentsDir);
+}
+
+export function isSubagentSessionPath(sessionPath, agentsDir) {
+  const rel = relativePathInsideBase(sessionPath, agentsDir);
+  if (rel === null) return false;
+  const parts = rel.split(path.sep);
+  return parts.length === 3 && parts[1] === "subagent-sessions" && parts[2].endsWith(".jsonl");
 }

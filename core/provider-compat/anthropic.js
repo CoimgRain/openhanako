@@ -6,10 +6,28 @@
  * contract available through normalizeProviderPayload.
  */
 
+import { modelSupportsAnthropicMaxEffort } from "../session-thinking-level.js";
+
 const CACHE_CONTROL = { type: "ephemeral" };
+const MAX_EFFORT_MIN_OUTPUT_TOKENS = 64000;
 
 function lower(value) {
   return typeof value === "string" ? value.toLowerCase() : "";
+}
+
+function positiveInteger(value) {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : null;
+}
+
+function getModelOutputLimit(model) {
+  return positiveInteger(model?.maxTokens || model?.maxOutput);
+}
+
+function isImplicitAnthropicOutputCap(value, model) {
+  const modelLimit = getModelOutputLimit(model);
+  if (!modelLimit) return false;
+  return positiveInteger(value) === Math.floor(modelLimit / 3);
 }
 
 function hasCacheControl(block) {
@@ -54,48 +72,70 @@ function normalizeSystem(system) {
   return { value: next, changed: true };
 }
 
-function normalizeLastUserMessage(messages) {
+function normalizeUserMessage(message) {
+  if (!message || message.role !== "user") {
+    return { value: message, changed: false, cacheable: false };
+  }
+
+  if (typeof message.content === "string") {
+    if (message.content.trim().length === 0) {
+      return { value: message, changed: false, cacheable: false };
+    }
+    return {
+      value: {
+        ...message,
+        content: [{
+          type: "text",
+          text: message.content,
+          cache_control: { ...CACHE_CONTROL },
+        }],
+      },
+      changed: true,
+      cacheable: true,
+    };
+  }
+
+  if (!Array.isArray(message.content) || message.content.length === 0) {
+    return { value: message, changed: false, cacheable: false };
+  }
+
+  const blockIndex = message.content.length - 1;
+  const lastBlock = message.content[blockIndex];
+  if (!shouldCacheContentBlock(lastBlock)) {
+    return { value: message, changed: false, cacheable: false };
+  }
+  if (hasCacheControl(lastBlock)) {
+    return { value: message, changed: false, cacheable: true };
+  }
+
+  const nextContent = message.content.slice();
+  nextContent[blockIndex] = withCacheControl(lastBlock);
+  return {
+    value: { ...message, content: nextContent },
+    changed: true,
+    cacheable: true,
+  };
+}
+
+function normalizeRecentUserMessages(messages) {
   if (!Array.isArray(messages) || messages.length === 0) {
     return { value: messages, changed: false };
   }
 
-  const lastIndex = messages.length - 1;
-  const lastMessage = messages[lastIndex];
-  if (!lastMessage || lastMessage.role !== "user") {
-    return { value: messages, changed: false };
-  }
-
-  if (typeof lastMessage.content === "string") {
-    if (lastMessage.content.trim().length === 0) {
-      return { value: messages, changed: false };
+  let next = messages;
+  let changed = false;
+  let marked = 0;
+  for (let i = messages.length - 1; i >= 0 && marked < 2; i--) {
+    const result = normalizeUserMessage(next[i]);
+    if (!result.cacheable) continue;
+    marked++;
+    if (result.changed) {
+      if (next === messages) next = messages.slice();
+      next[i] = result.value;
+      changed = true;
     }
-    const next = messages.slice();
-    next[lastIndex] = {
-      ...lastMessage,
-      content: [{
-        type: "text",
-        text: lastMessage.content,
-        cache_control: { ...CACHE_CONTROL },
-      }],
-    };
-    return { value: next, changed: true };
   }
-
-  if (!Array.isArray(lastMessage.content) || lastMessage.content.length === 0) {
-    return { value: messages, changed: false };
-  }
-
-  const blockIndex = lastMessage.content.length - 1;
-  const lastBlock = lastMessage.content[blockIndex];
-  if (!shouldCacheContentBlock(lastBlock) || hasCacheControl(lastBlock)) {
-    return { value: messages, changed: false };
-  }
-
-  const nextContent = lastMessage.content.slice();
-  nextContent[blockIndex] = withCacheControl(lastBlock);
-  const next = messages.slice();
-  next[lastIndex] = { ...lastMessage, content: nextContent };
-  return { value: next, changed: true };
+  return { value: next, changed };
 }
 
 export function matches(model) {
@@ -106,7 +146,44 @@ export function matches(model) {
   return model.compat?.cacheControlFormat === "anthropic";
 }
 
-export function apply(payload) {
+function shouldUseAnthropicMaxEffort(model, options) {
+  return options?.reasoningLevel === "xhigh" && modelSupportsAnthropicMaxEffort(model);
+}
+
+function withMaxEffort(payload) {
+  const next = { ...payload };
+  const thinking = payload.thinking && typeof payload.thinking === "object"
+    ? payload.thinking
+    : {};
+  if (thinking.type !== "adaptive") {
+    next.thinking = {
+      type: "adaptive",
+      display: thinking.display || "summarized",
+    };
+  }
+  next.output_config = { ...(payload.output_config || {}), effort: "max" };
+  return next;
+}
+
+function withMaxEffortOutputBudget(payload, model, options) {
+  const current = positiveInteger(payload.max_tokens);
+  const modelLimit = getModelOutputLimit(model);
+  if (!current || !modelLimit) return payload;
+  if (!isImplicitAnthropicOutputCap(current, model)) return payload;
+  const source = lower(options?.outputBudgetSource || options?.maxTokensSource);
+  if (source === "user" || source === "system") return payload;
+
+  const target = Math.min(modelLimit, MAX_EFFORT_MIN_OUTPUT_TOKENS);
+  if (current >= target) return payload;
+  return { ...payload, max_tokens: target };
+}
+
+function normalizeMaxEffort(payload, model, options) {
+  if (!shouldUseAnthropicMaxEffort(model, options)) return payload;
+  return withMaxEffortOutputBudget(withMaxEffort(payload), model, options);
+}
+
+export function apply(payload, model, options = {}) {
   let result = payload;
 
   if (Object.prototype.hasOwnProperty.call(payload, "system")) {
@@ -114,8 +191,10 @@ export function apply(payload) {
     if (system.changed) result = { ...result, system: system.value };
   }
 
-  const messages = normalizeLastUserMessage(result.messages);
+  const messages = normalizeRecentUserMessages(result.messages);
   if (messages.changed) result = { ...result, messages: messages.value };
+
+  result = normalizeMaxEffort(result, model, options);
 
   return result;
 }

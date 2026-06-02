@@ -112,6 +112,7 @@ describe("HanaEngine.buildTools", () => {
     const { customTools } = engine.buildTools(tmpDir, [
       { name: "browser", execute: vi.fn() },
       { name: "channel", execute: vi.fn() },
+      { name: "dm", execute: vi.fn() },
       { name: "cron", execute: vi.fn() },
     ], {
       agentDir,
@@ -168,19 +169,141 @@ describe("HanaEngine.buildTools", () => {
       sessionManager: { getSessionFile: () => sessionPath },
     });
 
-    expect(execute).toHaveBeenCalledWith("call-1", { ok: true }, expect.objectContaining({
-      agentId: "focus",
-      serverNodeId: "node_engine",
-      executionBoundary: expect.objectContaining({
-        boundaryId: "execb_node_engine_studio_engine",
-        serverNodeId: "node_engine",
-        studioId: "studio_engine",
-        workbench: {
-          kind: "legacy_agent_workbench",
-          root: workspace,
-        },
+    expect(execute).toHaveBeenCalledWith(
+      "call-1",
+      { ok: true },
+      expect.objectContaining({
+        sessionManager: expect.any(Object),
       }),
-    }));
+      undefined,
+      expect.objectContaining({
+        agentId: "focus",
+        serverNodeId: "node_engine",
+        sessionPath,
+        executionBoundary: expect.objectContaining({
+          boundaryId: "execb_node_engine_studio_engine",
+          serverNodeId: "node_engine",
+          studioId: "studio_engine",
+          workbench: {
+            kind: "legacy_agent_workbench",
+            root: workspace,
+          },
+        }),
+      }),
+    );
+  });
+
+  it("passes the explicit buildTools session path into plugin tool runtime context", async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "hana-build-tools-plugin-session-"));
+    const agentDir = path.join(tmpDir, "agents", "focus");
+    const workspace = path.join(tmpDir, "workspace");
+    const bridgeSessionPath = path.join(agentDir, "sessions", "bridge", "owner", "chat.jsonl");
+    const execute = vi.fn(async () => ({ content: [{ type: "text", text: "ok" }] }));
+    const agent = {
+      id: "focus",
+      agentDir,
+      config: {},
+      tools: [],
+    };
+
+    const engine = Object.create(HanaEngine.prototype);
+    engine.hanakoHome = tmpDir;
+    engine._runtimeContext = {
+      serverId: "server_engine",
+      serverNodeId: "node_engine",
+      studioId: "studio_engine",
+    };
+    engine.getAgent = vi.fn(() => agent);
+    engine._pluginManager = {
+      getAllTools: () => [{
+        name: "plugin_tool",
+        execute,
+      }],
+    };
+    engine._prefs = { getFileBackup: () => ({ enabled: false }) };
+    engine._readPreferences = () => ({ sandbox: true });
+    engine._confirmStore = null;
+    engine._emitEvent = vi.fn();
+    engine.getSessionPermissionMode = vi.fn(() => "operate");
+    engine._agentMgr = { agent };
+
+    const { customTools } = engine.buildTools(workspace, [], {
+      agentDir,
+      workspace,
+      getSessionPath: () => bridgeSessionPath,
+      getPermissionMode: () => "operate",
+    });
+    const pluginTool = customTools.find((tool) => tool.name === "plugin_tool");
+
+    await pluginTool.execute("call-1", { ok: true }, {});
+
+    expect(execute).toHaveBeenCalledWith(
+      "call-1",
+      { ok: true },
+      {},
+      undefined,
+      expect.objectContaining({
+        sessionPath: bridgeSessionPath,
+      }),
+    );
+  });
+
+  it("passes Pi SDK fifth-argument session ctx into plugin tools", async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "hana-build-tools-plugin-pi-ctx-"));
+    const agentDir = path.join(tmpDir, "agents", "focus");
+    const workspace = path.join(tmpDir, "workspace");
+    const desktopSessionPath = path.join(agentDir, "sessions", "desktop.jsonl");
+    const execute = vi.fn(async () => ({ content: [{ type: "text", text: "ok" }] }));
+    const agent = {
+      id: "focus",
+      agentDir,
+      config: {},
+      tools: [],
+    };
+
+    const engine = Object.create(HanaEngine.prototype);
+    engine.hanakoHome = tmpDir;
+    engine._runtimeContext = {
+      serverId: "server_engine",
+      serverNodeId: "node_engine",
+      studioId: "studio_engine",
+    };
+    engine.getAgent = vi.fn(() => agent);
+    engine._pluginManager = {
+      getAllTools: () => [{
+        name: "plugin_tool",
+        execute,
+      }],
+    };
+    engine._prefs = { getFileBackup: () => ({ enabled: false }) };
+    engine._readPreferences = () => ({ sandbox: true });
+    engine._confirmStore = null;
+    engine._emitEvent = vi.fn();
+    engine.getSessionPermissionMode = vi.fn(() => "operate");
+    engine._agentMgr = { agent };
+
+    const { customTools } = engine.buildTools(workspace, [], {
+      agentDir,
+      workspace,
+      getPermissionMode: () => "operate",
+    });
+    const pluginTool = customTools.find((tool) => tool.name === "plugin_tool");
+    const signal = new AbortController().signal;
+    const onUpdate = vi.fn();
+
+    await pluginTool.execute("call-1", { ok: true }, signal, onUpdate, {
+      sessionManager: { getSessionFile: () => desktopSessionPath },
+    });
+
+    expect(execute).toHaveBeenCalledWith(
+      "call-1",
+      { ok: true },
+      signal,
+      onUpdate,
+      expect.objectContaining({
+        sessionPath: desktopSessionPath,
+      }),
+    );
   });
 
   it("registers files created or modified by write and edit tools in the active session", async () => {
@@ -256,6 +379,55 @@ describe("HanaEngine.buildTools", () => {
       filePath: path.join(workspace, "draft.md"),
       origin: "agent_edit",
     });
+  });
+
+  it("blocks direct agent config edits from built-in file tools even when sandbox is disabled", async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "hana-build-tools-managed-config-"));
+    const agentDir = path.join(tmpDir, "agents", "focus");
+    const workspace = path.join(tmpDir, "workspace");
+    const configPath = path.join(agentDir, "config.yaml");
+    fs.mkdirSync(agentDir, { recursive: true });
+    fs.mkdirSync(workspace, { recursive: true });
+    fs.writeFileSync(configPath, "agent:\n  name: Hana\n  yuan: hanako\n", "utf-8");
+
+    const engine = Object.create(HanaEngine.prototype);
+    engine.hanakoHome = tmpDir;
+    engine.registerSessionFile = vi.fn();
+    engine.getAgent = vi.fn(() => ({ id: "focus", agentDir, tools: [] }));
+    engine._pluginManager = null;
+    engine._prefs = { getFileBackup: () => ({ enabled: false }) };
+    engine._readPreferences = () => ({ sandbox: false });
+    engine._confirmStore = null;
+    engine._emitEvent = vi.fn();
+    engine.getSessionPermissionMode = vi.fn(() => "operate");
+    engine._agentMgr = {
+      agent: {
+        id: "focus",
+        agentDir,
+        tools: [],
+      },
+    };
+
+    const { tools } = engine.buildTools(workspace, [], {
+      agentDir,
+      workspace,
+    });
+    const write = tools.find(tool => tool.name === "write");
+    const edit = tools.find(tool => tool.name === "edit");
+
+    const writeResult = await write.execute("write-config", {
+      path: configPath,
+      content: "agent:\n  name: Hana\n  yuan: caikangyong\n",
+    });
+    const editResult = await edit.execute("edit-config", {
+      path: configPath,
+      edits: [{ oldText: "yuan: hanako", newText: "yuan: caikangyong" }],
+    });
+
+    expect(writeResult.content[0].text).toContain("managed");
+    expect(editResult.content[0].text).toContain("managed");
+    expect(fs.readFileSync(configPath, "utf-8")).toContain("yuan: hanako");
+    expect(engine.registerSessionFile).not.toHaveBeenCalled();
   });
 
   it("keeps plugin dev Agent tools hidden until the global dev setting is enabled", () => {

@@ -2,19 +2,51 @@
  * Scheduler — Heartbeat + Cron 调度（v2）
  *
  * Heartbeat：所有有 desk 的 agent 各自并行跑，不依赖焦点 agent
- * Cron：所有 agent 独立并发，不随 active agent 切换而中断
+ * Cron：Studio 级任务列表统一调度，不随 active agent / workspace 切换而变化
  *
- * 通知策略：agent 自行决定是否调用 notify 工具，scheduler 不做通知判断。
+ * 通知策略：agent_session 由 agent 自行决定是否调用 notify 工具；
+ * direct_action:notify 由 scheduler 走统一通知网关执行；
+ * plugin_action 由 scheduler 到点调用指定插件工具。
  */
 
 import fs from "fs";
 import path from "path";
-import { createHeartbeat, HEARTBEAT_ACTIVITY_DIR } from "../lib/desk/heartbeat.js";
+import { createHeartbeat } from "../lib/desk/heartbeat.js";
 import { createCronScheduler } from "../lib/desk/cron-scheduler.js";
-import { CronStore } from "../lib/desk/cron-store.js";
+import {
+  executeDirectAutomationAction,
+  executePluginAutomationAction,
+  getAutomationExecutor,
+} from "../lib/desk/automation-executors.js";
 import { getLocale } from "../server/i18n.js";
 import { createFreshCompactDailyScheduler } from "../lib/fresh-compact/daily-scheduler.js";
 import { FreshCompactMaintainer } from "./fresh-compact-maintainer.js";
+import { createModuleLogger } from "../lib/debug-log.js";
+import { WORKSPACE_OUTPUT_ROOT_DIRNAME } from "../shared/workspace-output.js";
+
+const log = createModuleLogger("scheduler");
+const freshCompactLog = createModuleLogger("fresh-compact");
+
+function normalizeCronExecutionContext(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return {
+      kind: "missing",
+      cwd: null,
+      workspaceFolders: [],
+      sourceSessionPath: null,
+    };
+  }
+  return {
+    kind: typeof value.kind === "string" && value.kind.trim() ? value.kind.trim() : "session_workspace",
+    cwd: typeof value.cwd === "string" && value.cwd.trim() ? value.cwd : null,
+    workspaceFolders: Array.isArray(value.workspaceFolders)
+      ? value.workspaceFolders.filter(p => typeof p === "string" && p.trim())
+      : [],
+    sourceSessionPath: typeof value.sourceSessionPath === "string" && value.sourceSessionPath.trim()
+      ? value.sourceSessionPath
+      : null,
+  };
+}
 
 export class Scheduler {
   /**
@@ -24,12 +56,12 @@ export class Scheduler {
   constructor({ hub }) {
     this._hub = hub;
     this._heartbeats = new Map(); // agentId → heartbeat instance
-    this._agentCrons = new Map(); // agentId → CronScheduler
+    this._cronScheduler = null; // Studio CronScheduler
     this._executingJobs = new Map(); // jobId → AbortController（per-job 锁 + abort 控制）
     this._freshCompactMaintainer = new FreshCompactMaintainer({ hub });
     this._freshCompactScheduler = createFreshCompactDailyScheduler({
       runDaily: (opts) => this._freshCompactMaintainer.runDaily(opts),
-      warn: (msg) => console.warn(msg),
+      warn: (msg) => freshCompactLog.warn(msg),
     });
   }
 
@@ -42,44 +74,39 @@ export class Scheduler {
     return this._heartbeats.get(agentId) ?? null;
   }
 
-  /** 暴露某个 agent 的 cronScheduler */
+  /** 暴露 Studio cronScheduler（agentId 参数仅为兼容旧调用方） */
   getCronScheduler(agentId) {
-    if (!agentId) return null;
-    return this._agentCrons.get(agentId) ?? null;
+    return this._cronScheduler ?? null;
   }
 
   // ──────────── 生命周期 ────────────
 
   start() {
     this.startHeartbeat();
-    this._startAllCrons();
+    this._startStudioCron();
     this._freshCompactScheduler.start();
   }
 
   async stop() {
     this._freshCompactScheduler.stop();
     await this.stopHeartbeat();
-    for (const sched of this._agentCrons.values()) {
-      await sched.stop();
+    if (this._cronScheduler) {
+      await this._cronScheduler.stop();
+      this._cronScheduler = null;
     }
-    this._agentCrons.clear();
   }
 
-  /** 启动某个 agent 的 cron（幂等，已有则跳过） */
-  startAgentCron(agentId) { this._startAgentCron(agentId); }
+  /** 兼容旧 agent 生命周期调用：Studio cron 只有一个 scheduler */
+  startAgentCron(agentId) { this._startStudioCron(); }
 
   /** 为指定 agent 启动 heartbeat（公共 API，供 createAgent 等场景使用） */
   startAgentHeartbeat(agentId, agent) {
     this._startAgentHeartbeat(agentId, agent);
   }
 
-  /** 停止并移除某个 agent 的 cron */
+  /** 兼容旧 agent 生命周期调用：删除 agent 不停止 Studio cron scheduler */
   async removeAgentCron(agentId) {
-    const sched = this._agentCrons.get(agentId);
-    if (sched) {
-      await sched.stop();
-      this._agentCrons.delete(agentId);
-    }
+    return undefined;
   }
 
   /** 重建 heartbeat（支持指定 agentId 或全量） */
@@ -119,7 +146,7 @@ export class Scheduler {
           catch { return []; }
           const items = await Promise.all(
             entries
-              .filter(e => !e.name.startsWith(".") && e.name !== HEARTBEAT_ACTIVITY_DIR)
+              .filter(e => !e.name.startsWith(".") && e.name !== WORKSPACE_OUTPUT_ROOT_DIRNAME)
               .map(async (e) => {
                 const fp = path.join(dir, e.name);
                 let mtime = 0;
@@ -138,9 +165,12 @@ export class Scheduler {
       // 而该 cache 始终按 master 开关构建，与 per-session 开关解耦。
       // 用户关 master 时自动不带记忆；只关某个 session 的开关不影响这里。
       onBeat: (prompt) => this._executeActivityForAgent(agentId, prompt, "heartbeat", null, {}),
-      onJianBeat: (prompt, cwd) => {
+      onJianBeat: (prompt, cwd, runTools = {}) => {
         const isZh = getLocale().startsWith("zh");
-        this._executeActivityForAgent(agentId, prompt, "heartbeat", `${isZh ? "笺" : "jian"}:${path.basename(cwd)}`, { cwd });
+        this._executeActivityForAgent(agentId, prompt, "heartbeat", `${isZh ? "笺" : "jian"}:${path.basename(cwd)}`, {
+          cwd,
+          extraCustomTools: Array.isArray(runTools.customTools) ? runTools.customTools : [],
+        });
       },
       intervalMinutes: hbInterval,
       emitDevLog: (text, level) => engine.emitDevLog(text, level),
@@ -161,63 +191,120 @@ export class Scheduler {
     this._heartbeats.clear();
   }
 
-  // ──────────── Per-agent Cron ────────────
+  // ──────────── Studio Cron ────────────
 
-  _startAllCrons() {
+  _startStudioCron() {
+    if (this._cronScheduler) return;
     const engine = this._engine;
-    let entries;
-    try {
-      entries = fs.readdirSync(engine.agentsDir, { withFileTypes: true });
-    } catch { return; }
-
-    for (const e of entries) {
-      if (e.isDirectory()) this._startAgentCron(e.name);
-    }
-  }
-
-  _startAgentCron(agentId) {
-    if (this._agentCrons.has(agentId)) return;
-    const engine = this._engine;
-    const agentDir = path.join(engine.agentsDir, agentId);
-    const deskDir = path.join(agentDir, "desk");
-
-    let cronStore;
-    try {
-      cronStore = new CronStore(
-        path.join(deskDir, "cron-jobs.json"),
-        path.join(deskDir, "cron-runs"),
-      );
-    } catch { return; }
+    const cronStore = engine.getStudioCronStore?.();
+    if (!cronStore) return;
 
     const sched = createCronScheduler({
       cronStore,
-      executeJob: (job) => this._executeCronJobForAgent(agentId, job),
+      executeJob: (job) => this._executeCronJob(job),
       abortJob: (jobId) => {
         const ac = this._executingJobs.get(jobId);
-        if (ac) { ac.abort(); console.log(`\x1b[90m[scheduler] cron abort ${jobId} (timeout)\x1b[0m`); }
+        if (ac) { ac.abort(); log.log(`cron abort ${jobId} (timeout)`); }
       },
       onJobDone: (job, result) => {
         this._hub.eventBus.emit(
-          { type: "cron_job_done", jobId: job.id, label: job.label, agentId, result },
+          {
+            type: "cron_job_done",
+            jobId: job.id,
+            label: job.label,
+            agentId: job.actorAgentId,
+            actorAgentId: job.actorAgentId,
+            result,
+          },
           null,
         );
       },
     });
-    this._agentCrons.set(agentId, sched);
+    this._cronScheduler = sched;
     sched.start();
-    console.log(`\x1b[90m[scheduler] cron 已启动: ${agentId}\x1b[0m`);
+    log.log("Studio cron 已启动");
   }
 
   // ──────────── 执行 ────────────
+
+  async _executeCronJob(job) {
+    const executor = getAutomationExecutor(job);
+    if (executor.kind === "direct_action") {
+      return executeDirectAutomationAction(job, {
+        deliverNotification: (payload, opts) => this._engine.deliverNotification(payload, opts),
+      });
+    }
+    if (executor.kind === "plugin_action") {
+      return executePluginAutomationAction(job, {
+        invokePluginAction: (request, runtimeContext) => this._invokePluginAutomationAction(request, runtimeContext),
+      });
+    }
+    if (executor.kind !== "agent_session") {
+      throw new Error(`unsupported automation executor: ${executor.kind}`);
+    }
+    const actorAgentId = executor.agentId || job.actorAgentId || job.legacyRef?.agentId || null;
+    if (!actorAgentId) {
+      throw new Error(`cron job ${job.id} missing actorAgentId`);
+    }
+    await this._executeCronJobForAgent(actorAgentId, job, executor);
+    return { executorKind: "agent_session" };
+  }
+
+  async _invokePluginAutomationAction({ pluginId, actionId, params }, runtimeContext = {}) {
+    const pluginManager = this._engine.pluginManager;
+    if (!pluginManager) throw new Error("plugin manager unavailable");
+    const entry = typeof pluginManager.getPlugin === "function"
+      ? pluginManager.getPlugin(pluginId)
+      : null;
+    if (!entry) throw new Error(`plugin not found: ${pluginId}`);
+    if (entry.status !== "loaded") {
+      throw new Error(`plugin is not loaded: ${pluginId}`);
+    }
+    if (typeof pluginManager.getPluginTool !== "function"
+      || typeof pluginManager.executePluginTool !== "function") {
+      throw new Error("plugin manager tool invocation unavailable");
+    }
+    const tool = pluginManager.getPluginTool(pluginId, actionId, { entry });
+    if (!tool) throw new Error(`plugin action not found: ${pluginId}/${actionId}`);
+
+    const cwd = typeof runtimeContext.cwd === "string" && runtimeContext.cwd.trim()
+      ? runtimeContext.cwd
+      : null;
+    const executionBoundary = cwd && this._engine.runtimeContext
+      ? this._engine.createExecutionBoundary({ workbenchRoot: cwd })
+      : null;
+    return pluginManager.executePluginTool(tool, {
+      toolCallId: `automation-${runtimeContext.jobId || Date.now()}`,
+      input: params,
+      runtimeCtx: {
+        automation: {
+          jobId: runtimeContext.jobId || null,
+          label: runtimeContext.label || "",
+        },
+        agentId: runtimeContext.actorAgentId || null,
+        ...(runtimeContext.sessionPath ? {
+          sessionPath: runtimeContext.sessionPath,
+          sessionManager: {
+            getSessionFile: () => runtimeContext.sessionPath,
+            getCwd: () => cwd,
+          },
+        } : {}),
+        ...(executionBoundary ? {
+          serverNodeId: executionBoundary.serverNodeId,
+          executionBoundary,
+        } : {}),
+      },
+    });
+  }
 
   /**
    * 执行某个 agent 的 cron 任务（active 或非 active 均可）
    * 同一 agent 同时只运行一个 cron，防止并发写冲突
    */
-  async _executeCronJobForAgent(agentId, job) {
+  async _executeCronJobForAgent(agentId, job, executor = getAutomationExecutor(job)) {
     // per-job 锁：同一 job 不并发，但同一 agent 的不同 job 可以并行
     if (this._executingJobs.has(job.id)) {
-      console.log(`\x1b[90m[scheduler] cron 跳过 ${job.id}：上一次仍在执行\x1b[0m`);
+      log.log(`cron 跳过 ${job.id}：上一次仍在执行`);
       const err = new Error(`cron job ${job.id} 仍在执行，跳过`);
       err.skipped = true;
       throw err;
@@ -226,6 +313,8 @@ export class Scheduler {
     this._executingJobs.set(job.id, ac);
     try {
       const isZh = getLocale().startsWith("zh");
+      const promptBody = executor.prompt || job.prompt || "";
+      const model = executor.model || job.model || undefined;
       const prompt = isZh
         ? [
             `[定时任务 ${job.id}: ${job.label}]`,
@@ -233,7 +322,7 @@ export class Scheduler {
             "**注意：这是系统自动触发的定时任务，不是用户发来的。**",
             "**不要在执行过程中创建新的定时任务。**",
             "",
-            job.prompt,
+            promptBody,
           ].join("\n")
         : [
             `[Cron job ${job.id}: ${job.label}]`,
@@ -241,15 +330,25 @@ export class Scheduler {
             "**Note: This is an automated cron job, NOT a user message.**",
             "**Do not create new cron jobs during execution.**",
             "",
-            job.prompt,
+            promptBody,
           ].join("\n");
       await this._executeActivityForAgent(agentId, prompt, "cron", job.label, {
-        model: job.model || undefined,
+        model,
         signal: ac.signal,
+        ...this._cronExecutionOptions(job, executor),
       });
     } finally {
       this._executingJobs.delete(job.id);
     }
+  }
+
+  _cronExecutionOptions(job, executor = getAutomationExecutor(job)) {
+    const ctx = normalizeCronExecutionContext(executor.executionContext || job.executionContext);
+    const opts = {};
+    if (ctx.cwd) opts.cwd = ctx.cwd;
+    opts.workspaceFolders = ctx.workspaceFolders;
+    if (ctx.sourceSessionPath) opts.parentSessionPath = ctx.sourceSessionPath;
+    return opts;
   }
 
   /**

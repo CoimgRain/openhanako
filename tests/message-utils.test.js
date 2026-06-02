@@ -15,7 +15,12 @@ import {
   extractTextContent,
   loadSessionHistoryMessages,
   loadLatestAssistantSummaryFromSessionFile,
+  filterUnreferencedInlineImages,
   isValidSessionPath,
+  isActiveSessionPath,
+  isActiveDesktopSessionPath,
+  isArchivedDesktopSessionPath,
+  isDesktopSessionPath,
 } from "../core/message-utils.js";
 import { SessionManager } from "../lib/pi-sdk/index.js";
 
@@ -136,6 +141,32 @@ describe("extractTextContent", () => {
   });
 });
 
+describe("filterUnreferencedInlineImages", () => {
+  it("不把已有 attached_image 路径引用覆盖的图片 base64 返回给历史接口", () => {
+    const images = [
+      { data: "BASE64_A", mimeType: "image/png" },
+      { data: "BASE64_B", mimeType: "image/png" },
+    ];
+
+    expect(filterUnreferencedInlineImages(
+      "[attached_image: /tmp/a.png]\n[attached_image: /tmp/b.png]\ncompare",
+      images,
+    )).toEqual([]);
+  });
+
+  it("保留没有路径引用的 legacy inline 图片", () => {
+    const images = [
+      { data: "BASE64_A", mimeType: "image/png" },
+      { data: "BASE64_B", mimeType: "image/png" },
+    ];
+
+    expect(filterUnreferencedInlineImages(
+      "[attached_image: /tmp/a.png]\ncompare",
+      images,
+    )).toEqual([{ data: "BASE64_B", mimeType: "image/png" }]);
+  });
+});
+
 describe("isValidSessionPath", () => {
   it("合法子路径通过校验", () => {
     expect(isValidSessionPath("/tmp/agents/agent1/sessions/abc.jsonl", "/tmp/agents")).toBe(true);
@@ -156,6 +187,29 @@ describe("isValidSessionPath", () => {
   it("前缀相似但不是子路径时被拒绝", () => {
     // /tmp/agents-evil 不是 /tmp/agents 的子路径
     expect(isValidSessionPath("/tmp/agents-evil/session.jsonl", "/tmp/agents")).toBe(false);
+  });
+});
+
+describe("desktop session path predicates", () => {
+  it("splits active and archived desktop session paths", () => {
+    const agentsDir = "/tmp/agents";
+    const active = "/tmp/agents/agent1/sessions/abc.jsonl";
+    const archived = "/tmp/agents/agent1/sessions/archived/abc.jsonl";
+    const subagent = "/tmp/agents/agent1/subagent-sessions/child.jsonl";
+
+    expect(isActiveDesktopSessionPath(active, agentsDir)).toBe(true);
+    expect(isActiveSessionPath(active, agentsDir)).toBe(true);
+    expect(isArchivedDesktopSessionPath(active, agentsDir)).toBe(false);
+    expect(isDesktopSessionPath(active, agentsDir)).toBe(true);
+
+    expect(isActiveDesktopSessionPath(archived, agentsDir)).toBe(false);
+    expect(isActiveSessionPath(archived, agentsDir)).toBe(false);
+    expect(isArchivedDesktopSessionPath(archived, agentsDir)).toBe(true);
+    expect(isDesktopSessionPath(archived, agentsDir)).toBe(true);
+
+    expect(isActiveDesktopSessionPath(subagent, agentsDir)).toBe(false);
+    expect(isArchivedDesktopSessionPath(subagent, agentsDir)).toBe(false);
+    expect(isDesktopSessionPath(subagent, agentsDir)).toBe(false);
   });
 });
 
@@ -224,6 +278,61 @@ describe("loadSessionHistoryMessages", () => {
       { id: expect.any(String), role: "user", text: "new prompt" },
       { id: expect.any(String), role: "assistant", text: "new answer" },
     ]);
+  });
+
+  it("从 Pi session 分支恢复 custom_message 供后台结果重建 UI 块", async () => {
+    const sessionDir = path.join(tmpDir, "sessions");
+    const manager = SessionManager.create(tmpDir, sessionDir);
+    manager.appendMessage({ role: "assistant", content: [{ type: "text", text: "submitted" }] });
+    manager.appendCustomMessageEntry(
+      "hana-background-result",
+      "<hana-background-result task-id=\"task-img\" status=\"success\" type=\"image-generation\">{}</hana-background-result>",
+      false,
+      { source: "test" },
+    );
+
+    const result = await loadSessionHistoryMessages({}, manager.getSessionFile());
+
+    expect(result).toHaveLength(2);
+    expect(result[1]).toMatchObject({
+      role: "custom",
+      customType: "hana-background-result",
+      content: "<hana-background-result task-id=\"task-img\" status=\"success\" type=\"image-generation\">{}</hana-background-result>",
+      display: false,
+      details: { source: "test" },
+    });
+    expect(result[1].id).toEqual(expect.any(String));
+    expect(result[1].timestamp).toEqual(expect.any(String));
+  });
+
+  it("从 Pi session 分支恢复 custom entry 供非上下文后台结果重建 UI 块", async () => {
+    const sessionDir = path.join(tmpDir, "sessions");
+    const manager = SessionManager.create(tmpDir, sessionDir);
+    manager.appendMessage({ role: "assistant", content: [{ type: "text", text: "submitted" }] });
+    manager.appendCustomEntry("hana-deferred-result", {
+      schemaVersion: 1,
+      taskId: "task-img",
+      status: "success",
+      type: "image-generation",
+      result: { sessionFiles: [{ filePath: "/tmp/generated.png" }] },
+    });
+
+    const result = await loadSessionHistoryMessages({}, manager.getSessionFile());
+
+    expect(result).toHaveLength(2);
+    expect(result[1]).toMatchObject({
+      role: "custom",
+      customType: "hana-deferred-result",
+      data: {
+        schemaVersion: 1,
+        taskId: "task-img",
+        status: "success",
+        type: "image-generation",
+      },
+      display: false,
+    });
+    expect(result[1].id).toEqual(expect.any(String));
+    expect(result[1].timestamp).toEqual(expect.any(String));
   });
 });
 

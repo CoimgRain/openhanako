@@ -23,9 +23,16 @@ function dispatchInlineNotice(text: string, type: 'success' | 'error', deskDir?:
 type StoreSnapshot = ReturnType<typeof useStore.getState>;
 type ScreenshotRenderPayload = ScreenshotPayload & {
   saveDir?: string | null;
+  locale?: string;
   segmentIndex?: number;
   segmentTotal?: number;
 };
+
+export interface ArticleScreenshotOptions {
+  filePath?: string | null;
+  articleType?: string | null;
+  language?: string | null;
+}
 
 interface ScreenshotRenderResult {
   success: boolean;
@@ -97,6 +104,7 @@ async function buildScreenshotPayloadForMessages(
 ): Promise<ScreenshotRenderPayload> {
   const payload = extractScreenshotPayload(messages, theme) as ScreenshotRenderPayload;
   payload.saveDir = state.homeFolder || null;
+  payload.locale = window.i18n?.locale || state.locale || window.navigator?.language || 'zh';
   if (segment.total > 1) {
     payload.segmentIndex = segment.index;
     payload.segmentTotal = segment.total;
@@ -210,7 +218,7 @@ export async function takeScreenshot(targetMessageId: string, sessionPath: strin
 /**
  * Markdown 编辑器截图（纯文章模式）。
  */
-export async function takeArticleScreenshot(markdown: string): Promise<void> {
+export async function takeArticleScreenshot(markdown: string, options: ArticleScreenshotOptions = {}): Promise<void> {
   const color = localStorage.getItem('hana-screenshot-color') || 'light';
   const width = localStorage.getItem('hana-screenshot-width') || 'mobile';
   const theme = buildThemeName(color, width);
@@ -229,7 +237,11 @@ export async function takeArticleScreenshot(markdown: string): Promise<void> {
       mode: 'article',
       theme,
       markdown,
+      filePath: options.filePath || null,
+      articleType: options.articleType || 'markdown',
+      language: options.language || null,
       saveDir: homeFolder,
+      locale: window.i18n?.locale || useStore.getState().locale || window.navigator?.language || 'zh',
     });
 
     if (result.success) {

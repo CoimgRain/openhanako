@@ -2,7 +2,7 @@
 
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import React from 'react';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { InputArea } from '../../components/InputArea';
 import { useStore } from '../../stores';
 
@@ -191,6 +191,8 @@ function seedInputState(overrides: Partial<ReturnType<typeof useStore.getState>>
     attachedFiles: [],
     attachedFilesBySession: {},
     docContextAttached: false,
+    quoteCandidate: null,
+    quotedSelections: [],
     quotedSelection: null,
     models: [{
       id: 'deepseek-chat',
@@ -234,8 +236,11 @@ function tiptapBeforeInputHandler(): ((view: unknown, event: InputEvent) => bool
 }
 
 describe('InputArea paste and slash menu behavior', () => {
-  beforeEach(() => {
+  afterEach(() => {
     cleanup();
+  });
+
+  beforeEach(() => {
     vi.clearAllMocks();
     mocks.editorOptions = undefined;
     mocks.editorText = '';
@@ -355,6 +360,61 @@ describe('InputArea paste and slash menu behavior', () => {
       expect(mocks.loadSessions).toHaveBeenCalledTimes(1);
       expect(mocks.wsSend).toHaveBeenCalledTimes(1);
     });
+  });
+
+  it('sends chat quoted selection through the existing prompt quote contract', async () => {
+    seedInputState({
+      quotedSelections: [
+        {
+          text: '原句一',
+          sourceTitle: 'Assistant message',
+          sourceKind: 'chat',
+          sourceSessionPath: '/session/input.jsonl',
+          sourceMessageId: 'assistant-1',
+          sourceRole: 'assistant',
+          charCount: 3,
+        },
+        {
+          text: '原句二',
+          sourceTitle: 'note.md',
+          sourceKind: 'preview',
+          sourceFilePath: '/notes/note.md',
+          lineStart: 2,
+          lineEnd: 2,
+          charCount: 3,
+        },
+      ],
+    });
+    mocks.editorText = '请继续';
+    render(React.createElement(InputArea));
+
+    const preventDefault = vi.fn();
+    const event = new KeyboardEvent('keydown', { key: 'Enter', bubbles: true });
+    Object.defineProperty(event, 'preventDefault', { value: preventDefault });
+
+    const handled = tiptapKeyDownHandler()?.(null, event);
+
+    expect(handled).toBe(true);
+    expect(preventDefault).toHaveBeenCalledTimes(1);
+    await waitFor(() => {
+      expect(mocks.wsSend).toHaveBeenCalledTimes(1);
+    });
+    const payload = JSON.parse(String(mocks.wsSend.mock.calls[0][0]));
+    expect(payload.text).toBe([
+      '请继续',
+      '',
+      '[引用片段] 原句一',
+      '',
+      '[引用片段] note.md（第2-2行，共3字）路径: /notes/note.md',
+      '[引用原文]',
+      '原句二',
+      '[/引用原文]',
+    ].join('\n'));
+    expect(payload.displayMessage).toMatchObject({
+      text: '请继续',
+      quotedText: '原句一\n\n原句二',
+    });
+    expect(useStore.getState().quotedSelections).toEqual([]);
   });
 
   it('uploads mobile file-picker attachments through browser File API', async () => {

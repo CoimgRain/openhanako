@@ -40,6 +40,7 @@ describe('screenshot utils', () => {
       removeItem: vi.fn(),
       clear: vi.fn(),
     });
+    window.i18n = { locale: 'zh' } as typeof window.i18n;
     window.addEventListener('hana-inline-notice', noticeHandler);
     (window as any).t = (key: string) => (
       key === 'common.screenshotFailed' ? '截图保存失败'
@@ -53,6 +54,7 @@ describe('screenshot utils', () => {
     window.removeEventListener('hana-inline-notice', noticeHandler);
     delete (window as any).hana;
     delete (window as any).t;
+    delete (window as any).i18n;
   });
 
   it('主进程 IPC reject 时，给用户发出明确失败提示而不是变成未处理异常', async () => {
@@ -69,6 +71,44 @@ describe('screenshot utils', () => {
         text: expect.stringContaining('disk full'),
       }),
     ]);
+  });
+
+  it('Markdown article screenshots carry source file context for relative attachments', async () => {
+    (window as any).hana = {
+      screenshotRender: vi.fn().mockResolvedValue({ success: true, dir: '/tmp/hana-home/截图' }),
+    };
+
+    await expect(takeArticleScreenshot('![](<文本附件/a.png>)', {
+      filePath: '/vault/note.md',
+      articleType: 'markdown',
+    })).resolves.toBeUndefined();
+
+    expect((window as any).hana.screenshotRender).toHaveBeenCalledWith(expect.objectContaining({
+      mode: 'article',
+      markdown: '![](<文本附件/a.png>)',
+      filePath: '/vault/note.md',
+      articleType: 'markdown',
+    }));
+  });
+
+  it('code article screenshots carry type and language so code files render as code blocks', async () => {
+    (window as any).hana = {
+      screenshotRender: vi.fn().mockResolvedValue({ success: true, dir: '/tmp/hana-home/截图' }),
+    };
+
+    await expect(takeArticleScreenshot('const x = 1;', {
+      filePath: '/vault/app.ts',
+      articleType: 'code',
+      language: 'ts',
+    })).resolves.toBeUndefined();
+
+    expect((window as any).hana.screenshotRender).toHaveBeenCalledWith(expect.objectContaining({
+      mode: 'article',
+      markdown: 'const x = 1;',
+      filePath: '/vault/app.ts',
+      articleType: 'code',
+      language: 'ts',
+    }));
   });
 
   it('按截图页更新页码，并按选中的消息块数推进总进度', async () => {
@@ -112,6 +152,7 @@ describe('screenshot utils', () => {
     expect(storeMock.state.endScreenshotTask).toHaveBeenCalledOnce();
     expect((window as any).hana.screenshotRender).toHaveBeenCalledTimes(2);
     expect((window as any).hana.screenshotRender).toHaveBeenNthCalledWith(1, expect.objectContaining({
+      locale: 'zh',
       segmentIndex: 1,
       segmentTotal: 2,
     }));

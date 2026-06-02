@@ -9,6 +9,9 @@ import path from "path";
 import { callText } from "./llm-client.js";
 import { getLocale } from "../server/i18n.js";
 import { normalizePlainDescription } from "../lib/text/internal-narration.js";
+import { createModuleLogger } from "../lib/debug-log.js";
+
+const log = createModuleLogger("llm-utils");
 
 /** Pi SDK content block 是否为工具调用（兼容 tool_use / toolCall 两种格式） */
 export const isToolCallBlock = (b) => (b.type === "tool_use" || b.type === "toolCall") && !!b.name;
@@ -40,6 +43,8 @@ async function callLlm({
   timeoutMs,
   signal,
   quirks,
+  usageLedger,
+  usageContext,
 }) {
   return callText({
     api, model,
@@ -50,7 +55,25 @@ async function callLlm({
     ...(timeoutMs != null && { timeoutMs }),
     ...(signal != null && { signal }),
     ...(quirks != null && { quirks }),
+    ...(usageLedger != null && { usageLedger }),
+    ...(usageContext != null && { usageContext }),
   });
+}
+
+function utilityUsageContext(utilConfig, operation, trigger = "tool") {
+  const agentId = utilConfig?.usageAgentId || null;
+  const sessionPath = utilConfig?.usageSessionPath || null;
+  return {
+    source: {
+      subsystem: "utility",
+      operation,
+      surface: "system",
+      trigger,
+    },
+    attribution: sessionPath
+      ? { kind: "session", agentId, sessionPath }
+      : { kind: "utility", agentId },
+  };
 }
 
 /**
@@ -146,11 +169,13 @@ Rules:
       max_tokens: 50,
       timeoutMs: opts.timeoutMs,
       signal: opts.signal,
+      usageLedger: utilConfig.usageLedger,
+      usageContext: utilityUsageContext(utilConfig, "title", "user"),
     });
   } catch (err) {
     // AbortError（超时）不算失败，静默返回 null 让调用方走 fallback
     if (err.name === "AbortError" || err.name === "TimeoutError" || err.code === "LLM_TIMEOUT") return null;
-    console.error("[llm-utils] summarizeTitle failed:", err.message);
+    log.error(`summarizeTitle failed: ${err.message}`);
     return null;
   }
 }
@@ -179,12 +204,14 @@ export async function translateSkillNames(utilConfig, names, lang) {
       ],
       temperature: 0,
       max_tokens: 200,
+      usageLedger: utilConfig.usageLedger,
+      usageContext: utilityUsageContext(utilConfig, "translate_skill_names", "startup"),
     });
     if (!text) return {};
     const jsonMatch = text.match(/\{[\s\S]*\}/);
     return jsonMatch ? JSON.parse(jsonMatch[0]) : {};
   } catch (err) {
-    console.error("[llm-utils] translateSkillNames 失败:", err.message);
+    log.error(`translateSkillNames 失败: ${err.message}`);
     return {};
   }
 }
@@ -257,12 +284,14 @@ Rules:
       ],
       temperature: 0.3,
       maxTokens: 150,
+      usageLedger: utilConfig.usageLedger,
+      usageContext: utilityUsageContext(utilConfig, "activity_summary", "scheduled"),
     });
 
     return text;
   } catch (err) {
     log(`[summarize] error: ${err.message}`);
-    console.error("[llm-utils] summarizeActivity failed:", err.message);
+    log.error(`summarizeActivity failed: ${err.message}`);
     return null;
   }
 }
@@ -304,9 +333,11 @@ export async function summarizeActivityQuick(utilConfig, sessionPath) {
       ],
       temperature: 0.3,
       maxTokens: 80,
+      usageLedger: utilConfig.usageLedger,
+      usageContext: utilityUsageContext(utilConfig, "activity_summary_quick", "scheduled"),
     });
   } catch (err) {
-    console.error("[llm-utils] summarizeActivityQuick failed:", err.message);
+    log.error(`summarizeActivityQuick failed: ${err.message}`);
     return null;
   }
 }
@@ -395,11 +426,13 @@ Examples:
         { role: "user", content: name },
       ],
       max_tokens: 20,
+      usageLedger: utilConfig.usageLedger,
+      usageContext: utilityUsageContext(utilConfig, "generate_agent_id", "manual"),
     });
 
     base = sanitizeAgentId(text);
   } catch (err) {
-    console.error("[llm-utils] generateAgentId LLM failed:", err.message);
+    log.error(`generateAgentId LLM failed: ${err.message}`);
   }
 
   // LLM 失败或洗完太短 → 用 name 自己做 slug（比时间戳兜底更有语义）
@@ -445,13 +478,15 @@ export async function generateDescription(utilConfig, personality, locale) {
       ],
       temperature: 0.3,
       max_tokens: 200,
+      usageLedger: utilConfig.usageLedger,
+      usageContext: utilityUsageContext(utilConfig, "generate_description", "manual"),
     });
     if (!raw) return null;
 
     const text = normalizePlainDescription(raw, 100);
     return text || null;
   } catch (err) {
-    console.error("[llm-utils] generateDescription failed:", err.message);
+    log.error(`generateDescription failed: ${err.message}`);
     return null;
   }
 }

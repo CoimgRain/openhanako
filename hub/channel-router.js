@@ -17,18 +17,20 @@ import fs from "fs";
 import path from "path";
 import { createChannelTicker } from "../lib/channels/channel-ticker.js";
 import { Type } from "../lib/pi-sdk/index.js";
-import { appendMessage, formatMessagesForLLM, getChannelMeta, getRecentMessages } from "../lib/channels/channel-store.js";
+import { appendMessage, formatMessagesForLLM, getChannelMembers, getChannelMeta, getRecentMessages } from "../lib/channels/channel-store.js";
 import { extractMentionedAgentIds } from "../lib/channels/channel-mentions.js";
 import { loadConfig } from "../lib/memory/config-loader.js";
 import { callText } from "../core/llm-client.js";
 import { runAgentPhoneSession } from "./agent-executor.js";
-import { debugLog } from "../lib/debug-log.js";
+import { debugLog, createModuleLogger } from "../lib/debug-log.js";
 import { getLocale } from "../server/i18n.js";
 import {
-  getAgentPhoneProjectionPath,
-  readAgentPhoneProjection,
   recordAgentPhoneActivity,
 } from "../lib/conversations/agent-phone-projection.js";
+import {
+  readAgentPhoneRuntime,
+  resolveAgentPhoneRuntimeSessionPath,
+} from "../lib/conversations/agent-phone-runtime.js";
 import { normalizeAgentPhoneToolMode } from "../lib/conversations/agent-phone-session.js";
 import {
   DEFAULT_AGENT_PHONE_SETTINGS,
@@ -37,6 +39,8 @@ import {
   positiveIntegerOrDefault,
   positiveIntegerOrNull,
 } from "../lib/conversations/agent-phone-prompt.js";
+
+const log = createModuleLogger("channel");
 
 export class ChannelRouter {
   /**
@@ -142,13 +146,7 @@ export class ChannelRouter {
     try {
       const agent = this._getAgentInstance(agentId);
       const agentDir = agent?.agentDir || path.join(this._engine.agentsDir, agentId);
-      const projection = readAgentPhoneProjection(getAgentPhoneProjectionPath(agentDir, channelName));
-      const stored = projection.meta.phoneSessionFile;
-      if (!stored || typeof stored !== "string") return null;
-      const resolved = path.resolve(agentDir, ...stored.split("/").filter(Boolean));
-      const base = path.resolve(agentDir);
-      if (!resolved.startsWith(base + path.sep) && resolved !== base) return null;
-      return resolved;
+      return resolveAgentPhoneRuntimeSessionPath(agentDir, readAgentPhoneRuntime(agentDir, channelName));
     } catch {
       return null;
     }
@@ -166,6 +164,17 @@ export class ChannelRouter {
       setDecision?.(decision);
       return true;
     };
+    const isCurrentMember = () => {
+      if (!fs.existsSync(channelFile)) return false;
+      return getChannelMembers(channelFile).includes(agentId);
+    };
+    const notMemberResult = (action) => ({
+      content: [{
+        type: "text",
+        text: isZh ? "操作失败：你已不在这个频道中。" : "Action failed: you are no longer a member of this channel.",
+      }],
+      details: { action, error: "not a channel member" },
+    });
 
     return [
       {
@@ -186,6 +195,7 @@ export class ChannelRouter {
               details: { action: "read_context", error: "channel not found" },
             };
           }
+          if (!isCurrentMember()) return notMemberResult("read_context");
           const count = Math.max(1, Math.min(50, Number(params.count) || 20));
           const messages = getRecentMessages(channelFile, count);
           return {
@@ -237,6 +247,7 @@ export class ChannelRouter {
               details: { action: "reply", error: "channel not found" },
             };
           }
+          if (!isCurrentMember()) return notMemberResult("reply");
 
           const { timestamp } = await appendMessage(channelFile, agentId, content);
           const decision = {
@@ -282,6 +293,7 @@ export class ChannelRouter {
               details: { action: "pass", error: "already decided" },
             };
           }
+          if (!isCurrentMember()) return notMemberResult("pass");
           const decision = {
             type: "pass",
             replied: false,
@@ -317,6 +329,7 @@ export class ChannelRouter {
       onEvent: (event, data) => {
         this._hub.eventBus.emit({ type: event, ...data }, null);
       },
+      isEnabled: () => engine.isChannelsEnabled?.() !== false,
     });
     this._ticker.start();
   }
@@ -402,7 +415,7 @@ export class ChannelRouter {
         const mentionedAgents = this._extractMentionedAgents(channelName, message);
         const opts = mentionedAgents.length > 0 ? { mentionedAgents } : undefined;
         this.triggerImmediate(channelName, opts)?.catch(err =>
-          console.error(`[channel] agent post delivery 失败: ${err.message}`)
+          log.error(`agent post delivery 失败: ${err.message}`)
         );
       });
     }
@@ -443,8 +456,8 @@ export class ChannelRouter {
     proactive = false,
     mentionedAgents = [],
     mentionTargeted = false,
+    deliveryWindow = null,
   } = {}) {
-    const engine = this._engine;
     const msgText = formatMessagesForLLM(newMessages);
     const isZh = getLocale().startsWith("zh");
     const lastNewMessage = newMessages[newMessages.length - 1] || null;
@@ -455,6 +468,9 @@ export class ChannelRouter {
       isZh ? `已查看 ${newMessages.length} 条新消息` : `Viewed ${newMessages.length} new message(s)`,
       {
         messageCount: newMessages.length,
+        totalUnreadCount: deliveryWindow?.totalUnreadCount ?? newMessages.length,
+        droppedUnreadCount: deliveryWindow?.droppedUnreadCount ?? 0,
+        bookmarkState: deliveryWindow?.bookmarkState ?? null,
         lastMessageTimestamp: lastNewMessage?.timestamp || null,
       },
     );
@@ -468,19 +484,24 @@ export class ChannelRouter {
         proactive
           ? (isZh ? "收到频道提醒，正在看群聊" : "Received channel reminder and is reading")
           : (isZh ? "正在查看手机群聊" : "Reading phone channel messages"),
-        { messageCount: newMessages.length, proactive },
+        {
+          messageCount: newMessages.length,
+          proactive,
+          totalUnreadCount: deliveryWindow?.totalUnreadCount ?? newMessages.length,
+          droppedUnreadCount: deliveryWindow?.droppedUnreadCount ?? 0,
+        },
       );
       const decision = await this._executeReply(agentId, channelName, msgText, {
         signal,
         messageCount: newMessages.length,
+        deliveryWindow,
         proactive,
         mentionedAgents,
         mentionTargeted,
       });
 
       if (decision?.replied) {
-        console.log(`\x1b[90m[channel] ${agentId} replied #${channelName} (${decision.replyContent.length} chars)\x1b[0m`);
-        debugLog()?.log("channel", `${agentId} replied #${channelName} (${decision.replyContent.length} chars)`);
+        log.log(`${agentId} replied #${channelName} (${decision.replyContent.length} chars)`);
         await this._recordPhoneActivity(
           agentId,
           channelName,
@@ -529,8 +550,7 @@ export class ChannelRouter {
       );
       return { replied: false, missingDecision: true };
     } catch (err) {
-      console.error(`[channel] 回复失败 (${agentId}/#${channelName}): ${err.message}`);
-      debugLog()?.error("channel", `回复失败 (${agentId}/#${channelName}): ${err.message}`);
+      log.error(`回复失败 (${agentId}/#${channelName}): ${err.message}`);
       await this._recordPhoneActivity(
         agentId,
         channelName,
@@ -594,9 +614,24 @@ export class ChannelRouter {
       ].join("\n");
   }
 
+  _formatDeliveryWindowGuidance(deliveryWindow, isZh) {
+    const dropped = Number(deliveryWindow?.droppedUnreadCount || 0);
+    if (dropped <= 0) return "";
+    return isZh
+      ? [
+        `注意：较早的 ${dropped} 条未读消息没有放入本次投递窗口。`,
+        "需要更早上下文时，用 channel_read_context 读取频道 Truth，并结合此前 Phone Session 内容理解。",
+      ].join("\n")
+      : [
+        `Note: ${dropped} older unread message(s) were not included in this delivery window.`,
+        "Use channel_read_context to read the channel Truth when you need older context, and interpret this window together with the prior Phone Session content.",
+      ].join("\n");
+  }
+
   async _executeReply(agentId, channelName, msgText, {
     signal,
     messageCount = null,
+    deliveryWindow = null,
     proactive = false,
     mentionedAgents = [],
     mentionTargeted = false,
@@ -605,16 +640,17 @@ export class ChannelRouter {
     const phoneSettings = this._resolveChannelPhoneSettings(channelName);
     const promptGuidance = this._formatPhonePromptGuidance(agentId, phoneSettings, isZh);
     const behaviorGuidance = this._formatChannelBehaviorGuidance(agentId, mentionedAgents, mentionTargeted, isZh);
+    const deliveryWindowGuidance = this._formatDeliveryWindowGuidance(deliveryWindow, isZh);
     const zhIntro = proactive
       ? `你的手机收到了 #${channelName} 的频道提醒。\n\n`
         + `以下是最近的频道内容，来源是频道聊天记录 Truth，不是用户单独发给你的请求，也不一定是新消息：\n\n`
       : `你的手机收到了 #${channelName} 的新群聊消息。\n\n`
-        + `这些是这部手机尚未处理的新消息，来源是频道聊天记录 Truth，不是用户单独发给你的请求：\n\n`;
+        + `这些是本次投递窗口内未处理的新消息，不是频道全部历史；来源是频道聊天记录 Truth，不是用户单独发给你的请求：\n\n`;
     const enIntro = proactive
       ? `Your phone received a channel reminder for #${channelName}.\n\n`
         + `Here is recent channel content. The source is the channel transcript Truth, not a direct user request, and it may not be new:\n\n`
       : `Your phone received new messages in #${channelName}.\n\n`
-        + `These are the new messages this phone has not processed yet. The source is the channel transcript Truth, not a direct user request:\n\n`;
+        + `These are the unprocessed new messages inside this delivery window, not the channel's full history. The source is the channel transcript Truth, not a direct user request:\n\n`;
     let activeSessionPath = null;
     let decision = null;
     await runAgentPhoneSession(
@@ -624,17 +660,21 @@ export class ChannelRouter {
           text: isZh
             ? zhIntro
               + `${msgText || "（没有新消息）"}\n\n`
+              + `${deliveryWindowGuidance ? `${deliveryWindowGuidance}\n\n` : ""}`
               + `请像群聊成员一样阅读并行动：\n`
               + `${behaviorGuidance}\n`
               + `- 需要旧上下文时，用 channel_read_context 读取频道 Truth；需要事实和长期背景时，用 search_memory\n`
+              + `- 结合此前 Phone Session 内容理解这批消息；本次投递窗口不是频道全部历史\n`
               + `${promptGuidance}\n`
               + `- 本轮最后必须调用 channel_reply 或 channel_pass 之一完成动作\n`
               + `- 不要把最终群聊回复写在普通文本里；只有 channel_reply.content 会进入群聊`
             : enIntro
               + `${msgText || "(No new messages)"}\n\n`
+              + `${deliveryWindowGuidance ? `${deliveryWindowGuidance}\n\n` : ""}`
               + `Read and act like a group chat member:\n`
               + `${behaviorGuidance}\n`
               + `- Use channel_read_context for older channel Truth; use search_memory for facts and long-term background\n`
+              + `- Interpret this batch together with the prior Phone Session content; this delivery window is not the channel's full history\n`
               + `${promptGuidance}\n`
               + `- End this turn by calling exactly one of channel_reply or channel_pass\n`
               + `- Do not write the final channel reply as ordinary text; only channel_reply.content enters the channel`,
@@ -819,14 +859,14 @@ export class ChannelRouter {
       const agentInstance = this._getAgentInstance(agentId);
       const memoryMasterOn = this._resolveMemoryMasterEnabled(agentId, { agentInstance });
       if (!memoryMasterOn) {
-        console.log(`\x1b[90m[channel] ${agentId} memory master 已关闭，跳过频道记忆摘要\x1b[0m`);
+        log.log(`${agentId} memory master 已关闭，跳过频道记忆摘要`);
         return;
       }
 
       const utilCfg = engine.resolveUtilityConfig({ agentId }) || {};
       const { utility: model, api_key, base_url, api } = utilCfg;
       if (!api_key || !base_url || !api) {
-        console.log(`\x1b[90m[channel] ${agentId} 无 API 配置，跳过记忆摘要\x1b[0m`);
+        log.log(`${agentId} 无 API 配置，跳过记忆摘要`);
         return;
       }
 
@@ -858,13 +898,26 @@ export class ChannelRouter {
         }],
         temperature: 0.3,
         maxTokens: 200,
+        usageLedger: engine.usageLedger,
+        usageContext: {
+          source: {
+            subsystem: "memory",
+            operation: "channel_memory_summary",
+            surface: "channel",
+            trigger: "scheduled",
+          },
+          attribution: {
+            kind: "memory",
+            agentId,
+          },
+        },
       });
       const summaryText = this._normalizeChannelMemorySummary(rawSummary);
 
       const now = new Date();
       this._clearPreviousChannelMemoryFacts(factStore, sessionId, previousFacts);
       if (this._isEmptyChannelMemorySummary(summaryText)) {
-        console.log(`\x1b[90m[channel] ${agentId} memory cleared/no durable summary (#${channelName})\x1b[0m`);
+        log.log(`${agentId} memory cleared/no durable summary (#${channelName})`);
         return;
       }
       factStore.add({
@@ -874,9 +927,9 @@ export class ChannelRouter {
         session_id: sessionId,
       });
 
-      console.log(`\x1b[90m[channel] ${agentId} memory saved (#${channelName}, ${summaryText.length} chars)\x1b[0m`);
+      log.log(`${agentId} memory saved (#${channelName}, ${summaryText.length} chars)`);
     } catch (err) {
-      console.error(`[channel] 记忆摘要失败 (${agentId}/#${channelName}): ${err.message}`);
+      log.error(`记忆摘要失败 (${agentId}/#${channelName}): ${err.message}`);
     } finally {
       if (needClose) factStore?.close?.();
     }

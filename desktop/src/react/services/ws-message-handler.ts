@@ -16,6 +16,7 @@ import { loadDeskFiles } from '../stores/desk-actions';
 import {
   appendChannelMessage as appendChannelMessageAction,
   loadChannels as loadChannelsAction,
+  markChannelMessagesDirty as markChannelMessagesDirtyAction,
   openChannel as openChannelAction,
   upsertConversationAgentActivity as upsertConversationAgentActivityAction,
 } from '../stores/channel-actions';
@@ -40,6 +41,141 @@ export function configureWsMessageHandler(options: {
   requestContextUsage?: (sessionPath: string) => void;
 }): void {
   requestContextUsage = options.requestContextUsage || (() => {});
+}
+
+
+function buildOptimisticSubagentSession({
+  parentSessionPath,
+  taskId,
+  patch,
+  streamKey,
+  pending,
+}: {
+  parentSessionPath: string;
+  taskId: string;
+  patch: Record<string, any>;
+  streamKey?: string | null;
+  pending?: boolean;
+}) {
+  const state = useStore.getState() as any;
+  const parentSession = (state.sessions || []).find((session: any) => session.path === parentSessionPath) || null;
+  let subagentBlock: any = null;
+  const parentItems = state.chatSessions?.[parentSessionPath]?.items || [];
+  for (let i = parentItems.length - 1; i >= 0; i -= 1) {
+    const item = parentItems[i];
+    if (item?.type !== 'message' || item.data?.role !== 'assistant') continue;
+    subagentBlock = (item.data.blocks || []).find((block: any) => block?.type === 'subagent' && block.taskId === taskId);
+    if (subagentBlock) break;
+  }
+
+  const requesterAgentId = patch.requesterAgentId || patch.parentAgentId || parentSession?.agentId || state.currentAgentId || null;
+  const requesterAgent = requesterAgentId ? (state.agents || []).find((agent: any) => agent.id === requesterAgentId) : null;
+  const requesterAgentName = patch.requesterAgentNameSnapshot || patch.parentAgentNameSnapshot || requesterAgent?.name || parentSession?.agentName || requesterAgentId || null;
+  const executorAgentId = patch.executorAgentId || patch.agentId || subagentBlock?.executorAgentId || subagentBlock?.agentId || null;
+  const executorAgent = executorAgentId ? (state.agents || []).find((agent: any) => agent.id === executorAgentId) : null;
+  const executorAgentName = patch.executorAgentNameSnapshot || patch.agentName || subagentBlock?.executorAgentNameSnapshot || subagentBlock?.agentName || executorAgent?.name || executorAgentId || null;
+  const taskTitle = patch.taskTitle || subagentBlock?.taskTitle || subagentBlock?.task || patch.taskSummary || 'Agent 内部对话';
+  const now = new Date().toISOString();
+  const path = streamKey || `subagent-pending:${taskId}`;
+
+  return {
+    path,
+    title: `${requesterAgentName || 'Agent'} ↔ ${executorAgentName || 'Agent'}${taskTitle ? `: ${taskTitle}` : ''}`,
+    firstMessage: pending ? '正在建立内部对话…' : taskTitle,
+    modified: now,
+    messageCount: 0,
+    agentId: executorAgentId,
+    agentName: executorAgentName,
+    cwd: parentSession?.cwd || null,
+    pinnedAt: null,
+    hasSummary: false,
+    kind: 'subagent',
+    collaborationKind: 'subagent',
+    readOnly: true,
+    pendingSubagent: !!pending,
+    requesterAgentId,
+    requesterAgentName,
+    executorAgentId,
+    executorAgentName,
+    requestedAgentId: patch.requestedAgentId || subagentBlock?.requestedAgentId || null,
+    requestedAgentName: patch.requestedAgentNameSnapshot || subagentBlock?.requestedAgentName || null,
+    parentSessionPath,
+    taskId,
+    taskTitle,
+    subagentStatus: pending ? 'running' : (patch.streamStatus || 'running'),
+    subagentStartedAt: subagentBlock?.subagentStartedAt || subagentBlock?.startedAt || now,
+    subagentCompletedAt: null,
+    _optimistic: true,
+  };
+}
+
+function upsertPendingSubagentSession(parentSessionPath: string, block: Record<string, any>): void {
+  if (block?.type !== 'subagent' || typeof block.taskId !== 'string') return;
+  const pendingPath = `subagent-pending:${block.taskId}`;
+  const state = useStore.getState() as any;
+  if ((state.sessions || []).some((session: any) => session.path === pendingPath || session.taskId === block.taskId)) return;
+  const optimistic = buildOptimisticSubagentSession({
+    parentSessionPath,
+    taskId: block.taskId,
+    patch: block,
+    pending: true,
+  });
+  useStore.setState((prev: any) => ({ sessions: [optimistic, ...(prev.sessions || [])] }));
+}
+
+function upsertOptimisticSubagentSession(parentSessionPath: string, taskId: string, patch: Record<string, any>): void {
+  const streamKey = typeof patch.streamKey === 'string' ? patch.streamKey : null;
+  if (!streamKey) return;
+
+  const optimistic = buildOptimisticSubagentSession({
+    parentSessionPath,
+    taskId,
+    patch,
+    streamKey,
+    pending: false,
+  });
+
+  useStore.setState((prev: any) => {
+    const sessions = prev.sessions || [];
+    if (sessions.some((session: any) => session.path === streamKey)) return {};
+    const pendingPath = `subagent-pending:${taskId}`;
+    const idx = sessions.findIndex((session: any) => session.path === pendingPath || session.taskId === taskId);
+    if (idx >= 0) {
+      const next = [...sessions];
+      next[idx] = { ...sessions[idx], ...optimistic, pendingSubagent: false };
+      return { sessions: next };
+    }
+    return { sessions: [optimistic, ...sessions] };
+  });
+}
+
+function patchOptimisticSubagentSessionStatus(taskId: string, patch: Record<string, any>): void {
+  const streamKey = typeof patch.streamKey === 'string' ? patch.streamKey : null;
+  const streamStatus = typeof patch.streamStatus === 'string' ? patch.streamStatus : null;
+  if (!streamKey && !streamStatus) return;
+
+  const nextStatus = streamStatus === 'done' || streamStatus === 'failed' || streamStatus === 'aborted'
+    ? streamStatus
+    : 'running';
+  const terminal = nextStatus === 'done' || nextStatus === 'failed' || nextStatus === 'aborted';
+  const now = new Date().toISOString();
+
+  useStore.setState((prev: any) => {
+    let changed = false;
+    const sessions = (prev.sessions || []).map((session: any) => {
+      const matches = session?.taskId === taskId || (streamKey && session?.path === streamKey);
+      if (!matches) return session;
+      changed = true;
+      return {
+        ...session,
+        ...(streamKey ? { path: streamKey } : {}),
+        pendingSubagent: false,
+        subagentStatus: nextStatus,
+        subagentCompletedAt: terminal ? (session.subagentCompletedAt || now) : null,
+      };
+    });
+    return changed ? { sessions } : {};
+  });
 }
 
 // ── 聊天事件集合（走 StreamBufferManager） ──
@@ -159,6 +295,14 @@ function isKnownChatSession(sessionPath: string, state = useStore.getState()): b
   return !!state.chatSessions?.[sessionPath] || state.sessions.some((s: any) => s.path === sessionPath);
 }
 
+function requestInputFocusForCurrentSession(sessionPath: string | null): void {
+  if (!sessionPath) return;
+  const state = useStore.getState();
+  if (state.pendingNewSession) return;
+  if (state.currentSessionPath !== sessionPath) return;
+  state.requestInputFocus?.();
+}
+
 function applyCompactionLifecycle(msg: any): void {
   const sp = msg.sessionPath;
   if (!sp) return;
@@ -183,6 +327,7 @@ export function applyStreamingStatus(isStreaming: boolean, sessionPath: string |
   // 元数据层：把 isStreaming 视为 sessionPath 维度的权威信号，统一写回 streamingSessions。
   // 这一层不分焦点，任何来源（普通 status、stream_resume 恢复）都必须到达这里，
   // 否则重连后服务端说「已结束」前端却留着旧的 streaming 标记，UI 会卡在"思考中"。
+  const wasStreaming = !!sessionPath && useStore.getState().streamingSessions.includes(sessionPath);
   if (sessionPath) {
     if (isStreaming) {
       useStore.setState(s => ({
@@ -196,6 +341,10 @@ export function applyStreamingStatus(isStreaming: boolean, sessionPath: string |
         streamingSessions: s.streamingSessions.filter((p: string) => p !== sessionPath),
       }));
     }
+  }
+
+  if (!isStreaming && wasStreaming) {
+    requestInputFocusForCurrentSession(sessionPath);
   }
 
   // 渲染层：只有焦点 session 才影响 UI 占位 / sessions 列表。
@@ -283,17 +432,24 @@ export function handleServerMessage(msg: any): void {
   // 活跃 block 事件路由：非当前 session 的聊天事件也要写入正常聊天缓存。
   // stream-key-dispatcher 只负责卡片/预览订阅，不能吞掉主 transcript 的后台流。
   if (REACT_CHAT_EVENTS.has(msg.type) && msg.sessionPath && msg.sessionPath !== state.currentSessionPath) {
+    if (msg.type === 'content_block' && msg.block?.type === 'subagent') {
+      upsertPendingSubagentSession(msg.sessionPath, msg.block);
+    }
     if (isKnownChatSession(msg.sessionPath, state)) {
       streamBufferManager.handle(msg);
     }
     dispatchStreamKey(msg.sessionPath, msg);
     applyTodoToolEnd(msg);
     applyToolEndSessionFile(msg);
+    applyContentBlockSessionFile(msg);
     return;
   }
 
   // ── React 聊天渲染路径：聊天相关事件走 StreamBufferManager ──
   if (REACT_CHAT_EVENTS.has(msg.type)) {
+    if (msg.type === 'content_block' && msg.block?.type === 'subagent' && msg.sessionPath) {
+      upsertPendingSubagentSession(msg.sessionPath, msg.block);
+    }
     streamBufferManager.handle(msg);
     // turn_end 后仍需执行部分通用逻辑（loadSessions、context_usage）
     if (msg.type === 'turn_end') {
@@ -301,6 +457,7 @@ export function handleServerMessage(msg: any): void {
       const turnSp = msg.sessionPath;
       if (turnSp) {
         requestContextUsage(turnSp);
+        requestInputFocusForCurrentSession(turnSp);
       } else {
         console.warn('[ws] turn_end missing sessionPath, skipping context_usage request');
       }
@@ -310,6 +467,7 @@ export function handleServerMessage(msg: any): void {
     if (msg.type === 'tool_end') {
       applyToolEndSessionFile(msg);
     }
+    applyContentBlockSessionFile(msg);
     // COMPAT(create_artifact, remove no earlier than v0.133):
     // 旧 artifact block 进入当前 Preview 面板。
     if (msg.type === 'content_block' && msg.block?.type === 'artifact' && state.currentTab === 'chat') {
@@ -423,6 +581,16 @@ export function handleServerMessage(msg: any): void {
       if (!taskId || !patch) break;
       if (!sp) { console.warn('[ws] event missing sessionPath:', msg.type); break; }
       useStore.getState().patchBlockByTaskId(sp, taskId, patch);
+      patchOptimisticSubagentSessionStatus(taskId, patch as Record<string, any>);
+      if ((patch as { streamKey?: unknown }).streamKey) {
+        upsertOptimisticSubagentSession(sp, taskId, patch as Record<string, any>);
+        scheduleSessionsRefresh('subagent-stream-ready');
+      }
+      if ((patch as { streamStatus?: unknown }).streamStatus === 'done'
+        || (patch as { streamStatus?: unknown }).streamStatus === 'failed'
+        || (patch as { streamStatus?: unknown }).streamStatus === 'aborted') {
+        scheduleSessionsRefresh('subagent-settled');
+      }
       break;
     }
 
@@ -473,6 +641,7 @@ export function handleServerMessage(msg: any): void {
         data: {
           id: msg.message.id || `user-${Date.now()}`,
           role: 'user',
+          source: msg.message.source || undefined,
           text,
           textHtml: text ? renderMarkdown(text) : undefined,
           timestamp: normalizeMessageTimestamp(msg.message.timestamp),
@@ -555,12 +724,13 @@ export function handleServerMessage(msg: any): void {
 
     case 'channel_new_message': {
       const store = useStore.getState();
-      const isViewing = store.currentTab === 'channels' && store.currentChannel === msg.channelName && document.visibilityState === 'visible';
+      const isViewing = store.currentTab === 'channels' && store.currentChannel === msg.channelName;
       if (msg.channelName && isViewing && msg.message) {
         appendChannelMessageAction(msg.channelName, msg.message);
       } else if (msg.channelName && isViewing) {
         openChannelAction(msg.channelName);
       } else if (msg.channelName) {
+        markChannelMessagesDirtyAction(msg.channelName);
         loadChannelsAction();
       }
       break;
@@ -574,7 +744,7 @@ export function handleServerMessage(msg: any): void {
         break;
       }
       const dmId = `dm:${peerId}`;
-      const isViewingDM = store2.currentTab === 'channels' && store2.currentChannel === dmId && document.visibilityState === 'visible';
+      const isViewingDM = store2.currentTab === 'channels' && store2.currentChannel === dmId;
       if (isViewingDM) {
         openChannelAction(dmId, true);
       } else {
@@ -685,4 +855,28 @@ function applyToolEndSessionFile(msg: any): void {
   const sessionFile = msg.details?.sessionFile;
   if (!sp || !sessionFile) return;
   useStore.getState().upsertSessionRegistryFile?.(sp, sessionFile);
+}
+
+function applyContentBlockSessionFile(msg: any): void {
+  const sp = msg.sessionPath;
+  const block = msg.block;
+  if (!sp || block?.type !== 'file') return;
+  useStore.getState().upsertSessionRegistryFile?.(sp, {
+    id: block.fileId,
+    fileId: block.fileId,
+    filePath: block.filePath,
+    label: block.label,
+    ext: block.ext,
+    mime: block.mime,
+    kind: block.kind,
+    storageKind: block.storageKind,
+    status: block.status,
+    missingAt: block.missingAt,
+    mtimeMs: block.mtimeMs,
+    size: block.size,
+    version: block.version,
+    resource: block.resource,
+    origin: block.origin,
+    operations: block.operations,
+  });
 }

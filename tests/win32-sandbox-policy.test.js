@@ -30,7 +30,6 @@ describe("Windows sandbox policy projection", () => {
       externalDir,
       path.join(agentDir, "memory"),
       path.join(agentDir, "sessions"),
-      path.join(agentDir, "learned-skills"),
       path.join(hanakoHome, "user"),
       path.join(hanakoHome, "skills"),
       path.join(hanakoHome, "session-files"),
@@ -47,7 +46,7 @@ describe("Windows sandbox policy projection", () => {
 
   const real = (p) => fs.realpathSync(p);
 
-  it("projects required command grants separately from optional Hana grants", () => {
+  it("projects restricted-token write roots without external read grants", () => {
     const { hanakoHome, agentDir, workspace, externalDir } = makeTree();
     const externalFile = path.join(externalDir, "reference.md");
     const policy = deriveSandboxPolicy({
@@ -70,25 +69,16 @@ describe("Windows sandbox policy projection", () => {
       real(path.join(agentDir, "memory")),
       real(path.join(agentDir, "sessions")),
     ]));
-    expect(grants.readPaths).toEqual(expect.arrayContaining([
-      real(workspace),
-      real(externalFile),
-    ]));
-    expect(grants.optionalReadPaths).toEqual(expect.arrayContaining([
-      real(path.join(agentDir, "config.yaml")),
-      real(path.join(agentDir, "learned-skills")),
-      real(path.join(hanakoHome, "user")),
-      real(externalDir),
-    ]));
+    expect(grants.readPaths).toEqual([]);
+    expect(grants.optionalReadPaths).toEqual([]);
+    expect(grants.denyReadPaths).toEqual([]);
     expect(grants.writePaths).not.toContain(real(externalFile));
     expect(grants.optionalWritePaths).toContain(real(path.join(hanakoHome, ".ephemeral")));
     expect(grants.denyWritePaths).not.toContain(real(path.join(workspace, ".git")));
     expect(grants.denyWritePaths).not.toContain(real(path.join(hanakoHome, "session-files")));
-    expect(grants.denyReadPaths).toContain(real(path.join(hanakoHome, "auth.json")));
-    expect(grants.readPaths).not.toContain(path.join(hanakoHome, "auth.json"));
   });
 
-  it("keeps the Windows grant model functionality-first while still denying sensitive Hana reads", () => {
+  it("keeps the Windows write model functionality-first for Git worktrees", () => {
     const { hanakoHome, agentDir, workspace } = makeTree();
     const policy = deriveSandboxPolicy({
       agentDir,
@@ -106,10 +96,10 @@ describe("Windows sandbox policy projection", () => {
     expect(grants.writePaths).toContain(real(workspace));
     expect(grants.optionalWritePaths).toContain(real(path.join(hanakoHome, ".ephemeral")));
     expect(grants.denyWritePaths).not.toContain(real(path.join(workspace, ".git")));
-    expect(grants.denyReadPaths).toContain(real(path.join(hanakoHome, "auth.json")));
+    expect(grants.denyReadPaths).toEqual([]);
   });
 
-  it("projects ordinary system-readable roots as optional read grants while denying sensitive Hana files", () => {
+  it("does not project ordinary system-readable roots into ACL work", () => {
     const { hanakoHome, agentDir, workspace, externalDir } = makeTree();
     const policy = deriveSandboxPolicy({
       agentDir,
@@ -125,13 +115,57 @@ describe("Windows sandbox policy projection", () => {
       systemReadRoots: [externalDir],
     });
 
-    expect(grants.optionalReadPaths).toContain(real(externalDir));
+    expect(grants.readPaths).toEqual([]);
+    expect(grants.optionalReadPaths).toEqual([]);
     expect(grants.writePaths).not.toContain(real(externalDir));
     expect(grants.optionalWritePaths).not.toContain(real(externalDir));
-    expect(grants.denyReadPaths).toContain(real(path.join(hanakoHome, "auth.json")));
+    expect(grants.denyReadPaths).toEqual([]);
   });
 
-  it("keeps Hana prompt files optional so a bad ACL cannot block unrelated commands", () => {
+  it("keeps non-Git protected paths inside write roots as deny-write grants", () => {
+    const { hanakoHome, agentDir, workspace } = makeTree();
+    const protectedBuildCache = path.join(workspace, "protected-cache");
+    fs.mkdirSync(protectedBuildCache, { recursive: true });
+    const policy = deriveSandboxPolicy({
+      agentDir,
+      workspace,
+      workspaceFolders: [],
+      hanakoHome,
+      mode: "standard",
+    });
+    policy.protectedPaths.push(protectedBuildCache);
+
+    const grants = buildWin32SandboxGrants({
+      policy,
+      cwd: workspace,
+    });
+
+    expect(grants.writePaths).toContain(real(workspace));
+    expect(grants.denyWritePaths).toContain(real(protectedBuildCache));
+  });
+
+  it("projects explicit runtime writable roots for language caches and bundled runtimes", () => {
+    const { hanakoHome, agentDir, workspace } = makeTree();
+    const runtimeRoot = path.join(hanakoHome, ".ephemeral", "runtime-cache");
+    fs.mkdirSync(runtimeRoot, { recursive: true });
+    const policy = deriveSandboxPolicy({
+      agentDir,
+      workspace,
+      workspaceFolders: [],
+      hanakoHome,
+      runtimeWritablePaths: [runtimeRoot],
+      mode: "standard",
+    });
+
+    const grants = buildWin32SandboxGrants({
+      policy,
+      cwd: workspace,
+    });
+
+    expect(grants.optionalWritePaths).toContain(real(runtimeRoot));
+  });
+
+  it("keeps read-only Hana prompt files out of Windows ACL projection", () => {
     const { hanakoHome, agentDir, workspace, externalDir } = makeTree();
     const externalFile = path.join(externalDir, "reference.md");
     const optionalPrompt = path.join(agentDir, "config.yaml");
@@ -150,13 +184,10 @@ describe("Windows sandbox policy projection", () => {
       externalReadPaths: [externalFile],
     });
 
-    expect(grants.readPaths).toEqual(expect.arrayContaining([
-      real(workspace),
-      real(externalFile),
-    ]));
+    expect(grants.readPaths).toEqual([]);
     expect(grants.readPaths).not.toContain(real(optionalPrompt));
     expect(grants.readPaths).not.toContain(path.resolve(missingLegacyPrompt));
-    expect(grants.optionalReadPaths).toContain(real(optionalPrompt));
+    expect(grants.optionalReadPaths).toEqual([]);
     expect(grants.optionalReadPaths).not.toContain(path.resolve(missingLegacyPrompt));
   });
 

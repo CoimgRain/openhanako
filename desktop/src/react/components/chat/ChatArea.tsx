@@ -6,8 +6,11 @@
  */
 
 import { memo, useRef, useEffect, useState, useCallback, useMemo } from 'react';
+import type { PointerEvent as ReactPointerEvent } from 'react';
 import { useStore } from '../../stores';
 import { loadMoreMessages } from '../../stores/session-actions';
+import { captureChatSelection } from '../../stores/selection-actions';
+import { hanaUrl } from '../../hooks/use-hana-fetch';
 import { useContinuousBottomScroll } from '../../hooks/use-continuous-bottom-scroll';
 
 const EMPTY_ITEMS: ChatListItem[] = [];
@@ -70,16 +73,33 @@ function PanelHost() {
 // ── Panel：一个 session 的原生滚动容器 ──
 
 const SCROLL_THRESHOLD = 50;
+const TIMELINE_HOVER_ZONE_PX = 64;
+const TIMELINE_TOP_OFFSET_PX = 76;
+const TIMELINE_HEIGHT_RATIO = 0.5;
 
 const Panel = memo(function Panel({ path, active }: { path: string; active: boolean }) {
   const items = useStore(s => s.chatSessions[path]?.items || EMPTY_ITEMS);
   const hasMore = useStore(s => s.chatSessions[path]?.hasMore ?? false);
   const loadingMore = useStore(s => s.chatSessions[path]?.loadingMore ?? false);
   const isSessionStreaming = useStore(s => s.streamingSessions.includes(path));
-  const sessionAgentId = useStore(s => s.sessions.find(se => se.path === path)?.agentId ?? null);
+  const sessionInfo = useStore(s => s.sessions.find(se => se.path === path) ?? null);
+  const sessionAgentId = sessionInfo?.executorAgentId || sessionInfo?.agentId || null;
+  const readOnly = sessionInfo?.readOnly === true;
+  const userIdentity = useMemo(() => {
+    if (!readOnly) return undefined;
+    const requesterAgentId = sessionInfo?.requesterAgentId || null;
+    const requesterAgent = requesterAgentId
+      ? useStore.getState().agents.find(agent => agent.id === requesterAgentId)
+      : null;
+    return {
+      name: sessionInfo?.requesterAgentName || requesterAgent?.name || requesterAgentId || 'Agent',
+      avatarUrl: requesterAgent?.hasAvatar ? hanaUrl(`/api/agents/${requesterAgent.id}/avatar?t=${Date.now()}`) : null,
+    };
+  }, [readOnly, sessionInfo?.requesterAgentId, sessionInfo?.requesterAgentName]);
   const ref = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
   const messageElementsRef = useRef(new Map<string, HTMLDivElement>());
+  const [timelineRailVisible, setTimelineRailVisible] = useState(false);
   const bottomScroll = useContinuousBottomScroll({
     scrollRef: ref,
     contentRef,
@@ -93,6 +113,22 @@ const Panel = memo(function Panel({ path, active }: { path: string; active: bool
     } else {
       messageElementsRef.current.delete(messageId);
     }
+  }, []);
+  const handleCaptureSelection = useCallback(() => {
+    if (!active) return;
+    captureChatSelection(path);
+  }, [active, path]);
+  const handleShellPointerMove = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    const rect = event.currentTarget.getBoundingClientRect();
+    const xFromRight = rect.right - event.clientX;
+    const yFromTop = event.clientY - rect.top;
+    const inRailX = xFromRight >= 0 && xFromRight <= TIMELINE_HOVER_ZONE_PX;
+    const inRailY = yFromTop >= TIMELINE_TOP_OFFSET_PX
+      && yFromTop <= TIMELINE_TOP_OFFSET_PX + rect.height * TIMELINE_HEIGHT_RATIO;
+    setTimelineRailVisible(inRailX && inRailY);
+  }, []);
+  const handleShellPointerLeave = useCallback(() => {
+    setTimelineRailVisible(false);
   }, []);
 
   // scroll 事件维护 sticky 标志 + 上滑加载更多 + 滚动中显现 scrollbar
@@ -184,13 +220,22 @@ const Panel = memo(function Panel({ path, active }: { path: string; active: bool
   return (
     <div
       className={styles.sessionShell}
+      onPointerMove={handleShellPointerMove}
+      onPointerLeave={handleShellPointerLeave}
       style={{
         visibility: active ? 'visible' : 'hidden',
         zIndex: active ? 1 : 0,
         pointerEvents: active ? 'auto' : 'none',
       }}
     >
-      <div ref={ref} className={styles.sessionPanel}>
+      <div
+        ref={ref}
+        className={styles.sessionPanel}
+        data-chat-selection-root=""
+        data-session-path={path}
+        onMouseUp={handleCaptureSelection}
+        onKeyUp={handleCaptureSelection}
+      >
         <div ref={contentRef} className={styles.sessionMessages}>
           {hasMore && (
             <div className={styles.loadMoreHint}>
@@ -201,6 +246,8 @@ const Panel = memo(function Panel({ path, active }: { path: string; active: bool
             items={items}
             sessionPath={path}
             agentId={sessionAgentId}
+            readOnly={readOnly}
+            userIdentity={userIdentity}
             registerMessageElement={registerMessageElement}
           />
           {isSessionStreaming && (
@@ -215,6 +262,7 @@ const Panel = memo(function Panel({ path, active }: { path: string; active: bool
         contentRef={contentRef}
         messageElementsRef={messageElementsRef}
         active={active}
+        railVisible={timelineRailVisible}
       />
     </div>
   );
