@@ -283,3 +283,11 @@
 - 改动：运行 `npm run pack` 生成 `dist/mac-arm64/HanaAgent.app`；notarization 因缺少 Apple app-specific password 在最后失败，但 app 产物已生成。停止旧 Plus 14500 进程，备份旧应用到 `/Applications/Hanako Plus.app.backup-20260527-191518`，复制新产物到 `/Applications/Hanako Plus.app`。为保留用户熟悉名称，将主 executable、`CFBundleName`、`CFBundleDisplayName` 以及 Electron Helper app/executable 全部改为 `Hanako Plus`；保留 `CFBundleIdentifier=com.hanako.app`，并 patch `app.asar` 中 `package.json` 的 `productName=Hanako Plus`。重新移除 quarantine 并 ad-hoc codesign。
 - 验证：`codesign --verify --deep --strict /Applications/Hanako\ Plus.app` 通过；启动后主进程和 Helper 均显示 `Hanako Plus`，server 监听 `14500`，进程使用正式数据目录 `/Users/kang/Library/Application Support/Hanako`；带 `/Users/kang/.hanako/server-info.json` token 请求 `/api/health` 返回 `status: ok`、`version: 0.243.0`。
 - 风险/后续：本机安装为 ad-hoc 签名且未 notarize，适合本机使用；若未来再次从上游 `HanaAgent.app` 打包 Plus，必须同步重命名 Electron Helper，否则会触发 `Unable to find helper app` 启动崩溃。
+
+## 2026-06-02 11:30
+
+- 目标：让 `/Applications/Hanako.app` 普通版和 `/Applications/Hanako Plus.app` 能同时打开运行。
+- 背景：两个 app 原本都使用 `CFBundleIdentifier=com.hanako.app`、默认 `HANA_HOME=~/.hanako` 和 `14500`，会争抢 Electron 单实例锁、userData、server-info 和端口，不能稳定并开。
+- 改动：普通版保持原样：`com.hanako.app`、`~/.hanako`、`14500`。Plus 改为独立身份：主 app `CFBundleIdentifier=com.hanako.plus`，Helper 改为 `com.hanako.plus.helper*`；主可执行外层增加 wrapper，固定 `HANA_HOME=/Users/kang/.hanako-plus` 后再 exec `Hanako Plus.bin`；首次从 `~/.hanako` 复制一份数据到 `~/.hanako-plus`，并将 Plus 的 `server-network.json` 设为 loopback `14502`。
+- 验证：重新 ad-hoc codesign 后，Plus 监听 `127.0.0.1:14502`，普通版监听 `14500`；两个 app 进程同时存在，分别用 `~/.hanako-plus/server-info.json` 和 `~/.hanako/server-info.json` token 请求 `/api/health` 均返回 `status: ok`。
+- 风险/后续：Plus 与普通版现在是分离数据副本，不会继续实时共享聊天/配置；若需要同步，需要另行设计同步流程。以后重打 Plus 时必须保留 `com.hanako.plus`、wrapper 的 `HANA_HOME=/Users/kang/.hanako-plus` 和 `14502`，否则会再次与普通版冲突。
